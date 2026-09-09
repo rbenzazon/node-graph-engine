@@ -21,6 +21,10 @@ std::unique_ptr<Node> NodeFactory::create(std::string_view type_id) const {
   return it->second();
 }
 
+bool NodeFactory::contains(std::string_view type_id) const {
+  return creators_.find(std::string{type_id}) != creators_.end();
+}
+
 std::vector<std::string> NodeFactory::registered_types() const {
   std::vector<std::string> out;
   out.reserve(creators_.size());

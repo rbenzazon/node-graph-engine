@@ -2,7 +2,6 @@
 
 #include "node_engine/graph.hpp"
 
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -18,10 +17,15 @@ struct FlatEdge {
 struct FlatGraph {
   std::vector<NamedNode> nodes;
   std::vector<FlatEdge> edges;
+
+  Node* find_node(std::string const& id);
+  Node const* find_node(std::string const& id) const;
+  NamedNode* find_named(std::string const& id);
 };
 
 // Clone GraphNode macros, splice parent wires to inner neighbors,
 // drop wrappers + boundary nodes. Scheduler never sees nesting.
+// Authoring graph is not mutated (nodes are cloned).
 FlatGraph compile_flat(Graph const& authoring);
 
 }  // namespace node_engine

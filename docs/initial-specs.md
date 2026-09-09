@@ -11,22 +11,22 @@ todos:
     status: completed
   - id: core-types
     content: Add value/pin/node/graph/factory (C++20) with id-based wires and REGISTER_NODE
-    status: pending
+    status: completed
   - id: types-literals
     content: Implement type check, propagate_types, autoconvert table, unwired pin literals
-    status: pending
+    status: completed
   - id: flatten
     content: Implement Boundary nodes, GraphNode, instance clone, splice flatten to FlatGraph
-    status: pending
+    status: completed
   - id: taskflow
     content: Transient Taskflow scheduler + single compute(Slice) with ParallelHint grain splitting
-    status: pending
+    status: completed
   - id: temporal
     content: Chunk coalescer, buffer-to-stream, dirty prune + local sub-ticks
-    status: pending
+    status: completed
   - id: triggers-demo
     content: Trigger queue + edge/dirty event demo (incl. arm-then-go sequence in a custom node)
-    status: pending
+    status: completed
   - id: optional-later
     content: Defer WaitSequence/Select sugar, Shared lifetime, JSON I/O, SHM bridge, dedicated domains
     status: pending

@@ -33,7 +33,7 @@ Boundary pins               left)                Taskflow DAG
 4. **One `compute(Slice)`** — nodes stay thread-agnostic; the engine may split buffer work.
 5. **Dirty / emit control** — temporal gates and event logic are normal nodes + flags.
 
-Current code status: **bootstrap complete** (library skeleton, Taskflow linked, hello demo + smoke test). Core graph semantics are still being filled in per the specs.
+Current code status: **core engine implemented** (value/pin/node/graph/factory, validate + flatten with `GraphNode` splice, transient Taskflow scheduler with `ParallelHint`, temporal nodes, trigger queue, pipeline demo + expanded smoke tests). Optional later items (JSON, SHM, WaitSequence sugar, Shared lifetime) remain deferred — see [docs/initial-specs.md](docs/initial-specs.md).
 
 ---
 

@@ -17,9 +17,13 @@ option(NODE_ENGINE_BUILD_TESTS "Build tests" ON)
 include(cmake/Dependencies.cmake)
 
 add_library(node_engine
+  src/engine.cpp
   src/factory.cpp
   src/flatten.cpp
   src/graph.cpp
+  src/graph_node.cpp
+  src/node.cpp
+  src/register_builtin_nodes.cpp
   src/scheduler.cpp
   src/trigger_queue.cpp
 )

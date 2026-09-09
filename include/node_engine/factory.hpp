@@ -19,6 +19,7 @@ class NodeFactory {
 
   void register_type(std::string type_id, NodeCreator creator);
   [[nodiscard]] std::unique_ptr<Node> create(std::string_view type_id) const;
+  [[nodiscard]] bool contains(std::string_view type_id) const;
   [[nodiscard]] std::vector<std::string> registered_types() const;
 
  private:
@@ -33,9 +34,9 @@ struct NodeRegistrar {
 
 }  // namespace node_engine
 
-#define REGISTER_NODE(Type)                                                     \
-  static ::node_engine::NodeRegistrar g_node_registrar_##Type{                  \
-      std::string{Type{}.type_id()},                                            \
-      []() -> std::unique_ptr<::node_engine::Node> {                            \
-        return std::make_unique<Type>();                                        \
+#define REGISTER_NODE(Type)                                    \
+  static ::node_engine::NodeRegistrar g_node_registrar_##Type{ \
+      std::string{Type::meta.type_id},                         \
+      []() -> std::unique_ptr<::node_engine::Node> {           \
+        return std::make_unique<Type>();                       \
       }}

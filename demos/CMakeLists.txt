@@ -1,12 +1,14 @@
-add_executable(minimal_pipeline minimal_pipeline.cpp)
+function(node_engine_demo name)
+  add_executable(${name} ${name}.cpp)
+  target_link_libraries(${name} PRIVATE node_engine::node_engine)
+  target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/nodes)
+  if(MSVC)
+    target_compile_options(${name} PRIVATE /W4 /permissive-)
+  else()
+    target_compile_options(${name} PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+endfunction()
 
-target_link_libraries(minimal_pipeline
-  PRIVATE
-    node_engine::node_engine
-)
-
-if(MSVC)
-  target_compile_options(minimal_pipeline PRIVATE /W4 /permissive-)
-else()
-  target_compile_options(minimal_pipeline PRIVATE -Wall -Wextra -Wpedantic)
-endif()
+node_engine_demo(minimal_pipeline)
+node_engine_demo(coalesce_stream_demo)
+node_engine_demo(bench_parallel_scale)
