@@ -20,19 +20,24 @@ class BufferToStream : public NodeBase<BufferToStream> {
   }
 
   void compute(Slice) override {
-    // Reload queue when a new connected buffer arrives and queue is empty.
+    // Reload queue when a new non-empty buffer arrives and local queue is empty.
     if (queue_.empty()) {
       auto const& buf = buffer_in("chunk");
-      queue_ = buf;
-      index_ = 0;
+      if (!buf.empty()) {
+        queue_ = buf;
+        index_ = 0;
+      }
     }
     if (index_ >= queue_.size()) {
+      // Idle: no sample this compute. Clear active so gated sinks ignore stale values.
       set_out("active", false);
       queue_.clear();
       index_ = 0;
       suppress();
       return;
     }
+    // Emit one sample. active=true for every produced sample (including the last)
+    // so gated consumers can record this value; a later idle compute clears active.
     set_out("sample", queue_[index_]);
     set_out("active", true);
     ++index_;
