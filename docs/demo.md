@@ -746,7 +746,7 @@ Prove a **multi-root, desynced** line-quality monitor with **no sensor mux choke
 3. Virtual-time event queue drives edges at different periods (~20 / 7 / 2 kHz frames).
 4. Late join only at **fusion** (LKG + freshness + motion gates + go/nogo).
 5. Planted spike, dent, encoder stop, and stale-C paths flip go correctly; coalescer counts **frames**, not emits.
-6. Phase B: three async producer threads + mutex-guarded arm/poll for **~60 s** wall-time capacity smoke.
+6. Phase B: three async producer threads + mutex-guarded arm/poll for **~5 s** (iteration default; raise to 60s when stable), with **1 Hz live metrics** (input emit/frame/MB/s, poll rate, coalescer, fusion state, PLC/HMI rates).
 
 ### Graph (authoring)
 
@@ -786,7 +786,7 @@ No node fans into the three edges; no `sensor_mux` / `edge_daq_all`.
 | Phase A K=1 | spike, dent, go true, go false on stop, go false on stale C, `coal_ready ≥ 1` |
 | Phase A K=10 | same correctness; **fewer** thick emits than K=1 for similar duration |
 | Coalesce K=W=20 | single emit → `ready=true`, window size `24*20` |
-| Phase B | each async edge produces >0 emits in ~60 s wall |
+| Phase B | each async edge produces >0 emits in ~5 s wall; live 1 Hz metric blocks printed |
 | Exit | `line_quality_monitor_demo ok`, exit `0` |
 
 ### Observed results (sample, Debug, MSVC 19.44)
@@ -810,9 +810,18 @@ go_false_stop=1 go_false_stale=1 nogo=0 mes_events=0
 --- coalesce K=W=20 single emit ---
 single-emit full window ok
 
---- Phase B light (async producers, ~60s wall) ---
-wall_s≈60 emit_hz A/B/C and frame_hz printed; non-zero emits
-plc_emits > 0
+--- Phase B light (async producers, ~5s wall) ---
+targets: thick … | dist … | enc …
+live metrics every 1s …
+[  1s]
+  INPUT inst  A … emit/s … frame/s … MB/s   B …   C …
+  INPUT avg   …
+  GRAPH       poll … Hz  coal_win …  in_payload … MB/s
+  KEY NODES   fusion go=… | thick mean=… | dist dent=… | enc line_ok=… pos_mm=…
+  SINKS       plc … Hz  hmi … Hz  go_true …%
+…
+=== Phase B summary (60.0s wall) ===
+INPUT rates / PAYLOAD / GRAPH / SINKS totals
 
 line_quality_monitor_demo ok
 ```
@@ -822,7 +831,7 @@ line_quality_monitor_demo ok
 - Dual format is frame-count based: K=10 used ~10× fewer thick emits for similar frame count.
 - Coalescer completed full windows on both paths and on a single K=W emit.
 - Stale-C and encoder-stop both forced go false; healthy motion allowed go true.
-- Phase B runs ~**1 minute** wall at reduced rates (Debug capacity smoke), not a full 20 kHz RT claim.
+- Phase B currently runs ~**5 s** (iteration) with a live dashboard: per-edge input rate & payload MB/s, graph poll/coalesce bandwidth, fusion/key-node state, sink update rates. Targets are a ~**10× plant stress** (A 200 kHz / B 70 kHz / C 20 kHz) with large batched K so emit cadence stays ~1 kHz under Windows sleep granularity; achieved rates will lag on Debug when the poll path saturates.
 
 ---
 

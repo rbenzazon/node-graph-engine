@@ -623,26 +623,65 @@ int main() {
     std::cout << "single-emit full window ok\n";
   }
 
-  // --- Phase B light: free-run async producers, measure emit rates ---
-  constexpr double kPhaseBWallS = 60.0;
+  // --- Phase B light: free-run async producers + live metrics ---
+  // Keep short while iterating metrics/stability; raise back to 60s when stable.
+  constexpr double kPhaseBWallS = 5.0;
+  constexpr double kMetricPeriodS = 1.0;
+  // Stress bandwidth: ~10x plant frame rates (A 200 kHz / B 70 kHz / C 20 kHz).
+  // Large K keeps emit cadence ~1 kHz under Windows sleep granularity while
+  // payload/frame throughput tracks the high target rates.
+  constexpr double kPeriodA = 5e-6;            // 200 kHz thickness frames
+  constexpr double kPeriodB = 1.0 / 70000.0;   // ~70 kHz distance
+  constexpr double kPeriodC = 1.0 / 20000.0;   // 20 kHz encoder
+  constexpr std::size_t kKa = 200;             // 1 kHz emits @ 200 k frames/s
+  constexpr std::size_t kKb = 50;              // 1.4 kHz emits @ 70 k frames/s
+  constexpr std::size_t kKc = 20;              // 1 kHz emits @ 20 k frames/s
   std::cout << "\n--- Phase B light (async producers, ~" << kPhaseBWallS << "s wall) ---\n";
+  std::cout << "targets: thick " << (1.0 / kPeriodA) << " frame/s K=" << kKa
+            << " | dist " << (1.0 / kPeriodB) << " frame/s K=" << kKb
+            << " | enc " << (1.0 / kPeriodC) << " frame/s K=" << kKc << '\n';
+  std::cout << "live metrics every " << kMetricPeriodS
+            << "s (inst = last interval, avg = cumulative)\n";
+  std::cout << "  INPUT     per-edge emit/s, frame/s, payload MB/s (24ch x f64)\n";
+  std::cout << "  GRAPH     poll/s, coalescer window/s, total input MB/s, trigger-queue pressure\n";
+  std::cout << "  KEY NODES fusion go/nogo/fault, age_ms A/B/C, thick mean/spike, dent, line_ok, pos_mm\n";
+  std::cout << "  SINKS     PLC/HMI update Hz and go_true share over the last interval\n\n";
+
   {
     Ring ring_a = make_thickness_ring(20000, 99999);
     Ring ring_b = make_distance_ring(20000, 99999);
     Ring ring_c = make_encoder_ring(20000, 99999, 0, 10.0);
 
+    h.filt_a->reset_state();
+    h.filt_b->reset_state();
+    h.coal_a->reset();
+    h.rules_a->reset_state();
+    h.enc->reset_state();
+    h.fusion->reset_state();
+    h.plc->reset_counts();
+    h.mes->reset_counts();
+
+    // Phase B is a capacity smoke: producers can outrun Debug poll briefly.
+    // Widen freshness so brief queue delay is not always reported as sensor stale.
+    flat.find_node("fusion")->find_input("stale_a")->literal = 0.050;
+    flat.find_node("fusion")->find_input("stale_b")->literal = 0.050;
+    flat.find_node("fusion")->find_input("stale_c")->literal = 0.050;
+
     std::atomic<bool> run{true};
     std::atomic<std::uint64_t> emits_a{0}, emits_b{0}, emits_c{0};
     std::atomic<std::uint64_t> frames_a{0}, frames_b{0}, frames_c{0};
-    std::atomic<std::uint64_t> q_hwm{0};
+    std::atomic<std::uint64_t> bytes_a{0}, bytes_b{0}, bytes_c{0};
+    std::atomic<std::uint64_t> polls_ok{0};
+    std::atomic<std::uint64_t> q_busy_hits{0};  // polls that saw a non-empty trigger queue
+    std::atomic<std::uint64_t> coal_windows{0};
     std::mutex arm_mu;
+    auto const t0 = clock::now();
 
     auto producer = [&](char const* id, FrameEdgeSource* edge, Ring const* ring, double period,
                         std::size_t K, std::atomic<std::uint64_t>* emits,
-                        std::atomic<std::uint64_t>* frames) {
+                        std::atomic<std::uint64_t>* frames, std::atomic<std::uint64_t>* bytes) {
       std::size_t idx = 0;
-      double t = 0.0;
-      auto deadline = clock::now();
+      auto deadline = t0;
       while (run.load(std::memory_order_relaxed)) {
         deadline += std::chrono::duration_cast<clock::duration>(
             std::chrono::duration<double>(period * static_cast<double>(K)));
@@ -656,63 +695,239 @@ int main() {
           std::copy(src, src + kChannels, buf.data() + f * kChannels);
         }
         idx += K;
+        std::uint64_t nbytes = static_cast<std::uint64_t>(buf.size()) *
+                               static_cast<std::uint64_t>(sizeof(double));
+        // Wall stamp so fusion freshness tracks real delivery lag, not ideal virtual time drift.
+        double t_stamp = std::chrono::duration<double>(clock::now() - t0).count();
         {
           std::lock_guard<std::mutex> lock(arm_mu);
-          edge->set_emit(std::move(buf), t, K);
+          edge->set_emit(std::move(buf), t_stamp, K);
           engine.triggers().push(id);
         }
-        t += period * static_cast<double>(K);
         emits->fetch_add(1, std::memory_order_relaxed);
         frames->fetch_add(K, std::memory_order_relaxed);
+        bytes->fetch_add(nbytes, std::memory_order_relaxed);
       }
     };
 
-    // Slow periods so Debug build can keep up (capacity demo, not full 20 kHz RT).
-    std::thread ta(producer, "edge_thick", h.edge_thick, &ring_a, 200e-6, std::size_t{5}, &emits_a,
-                   &frames_a);
-    std::thread tb(producer, "edge_dist", h.edge_dist, &ring_b, 500e-6, std::size_t{1}, &emits_b,
-                   &frames_b);
-    std::thread tc(producer, "edge_enc", h.edge_enc, &ring_c, 1e-3, std::size_t{1}, &emits_c,
-                   &frames_c);
+    std::thread ta(producer, "edge_thick", h.edge_thick, &ring_a, kPeriodA, kKa, &emits_a, &frames_a,
+                   &bytes_a);
+    std::thread tb(producer, "edge_dist", h.edge_dist, &ring_b, kPeriodB, kKb, &emits_b, &frames_b,
+                   &bytes_b);
+    std::thread tc(producer, "edge_enc", h.edge_enc, &ring_c, kPeriodC, kKc, &emits_c, &frames_c,
+                   &bytes_c);
 
-    auto t0 = clock::now();
+    auto rate = [](std::uint64_t n, double dt) {
+      return dt > 0.0 ? static_cast<double>(n) / dt : 0.0;
+    };
+    auto mib_s = [](std::uint64_t nbytes, double dt) {
+      return dt > 0.0 ? (static_cast<double>(nbytes) / (1024.0 * 1024.0)) / dt : 0.0;
+    };
+
+    auto t_last = t0;
+    std::uint64_t ea0 = 0, eb0 = 0, ec0 = 0;
+    std::uint64_t fa0 = 0, fb0 = 0, fc0 = 0;
+    std::uint64_t ba0 = 0, bb0 = 0, bc0 = 0;
+    std::uint64_t polls0 = 0, coal0 = 0, qbusy0 = 0;
+    std::uint64_t plc0 = 0, hmi0 = 0, go0 = 0;
+
+    std::cout << std::fixed;
     while (std::chrono::duration<double>(clock::now() - t0).count() < kPhaseBWallS) {
       bool ran = false;
       {
         std::lock_guard<std::mutex> lock(arm_mu);
-        h.fusion_node->find_input("t_now")->literal =
-            std::chrono::duration<double>(clock::now() - t0).count();
+        double t_now = std::chrono::duration<double>(clock::now() - t0).count();
+        h.fusion_node->find_input("t_now")->literal = t_now;
         if (!engine.triggers().empty()) {
-          q_hwm.fetch_add(1, std::memory_order_relaxed);
+          q_busy_hits.fetch_add(1, std::memory_order_relaxed);
         }
         ran = engine.poll_trigger_and_run(flat);
+        if (ran) {
+          polls_ok.fetch_add(1, std::memory_order_relaxed);
+          auto* ready = flat.find_node("coal_a")->find_output("ready");
+          if (ready && std::holds_alternative<bool>(ready->buffer) &&
+              std::get<bool>(ready->buffer)) {
+            coal_windows.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
       }
       if (!ran) {
         std::this_thread::sleep_for(std::chrono::microseconds(50));
       }
+
+      auto now = clock::now();
+      double d_int = std::chrono::duration<double>(now - t_last).count();
+      if (d_int < kMetricPeriodS) {
+        continue;
+      }
+
+      double wall = std::chrono::duration<double>(now - t0).count();
+      std::uint64_t ea = emits_a.load(std::memory_order_relaxed);
+      std::uint64_t eb = emits_b.load(std::memory_order_relaxed);
+      std::uint64_t ec = emits_c.load(std::memory_order_relaxed);
+      std::uint64_t fa = frames_a.load(std::memory_order_relaxed);
+      std::uint64_t fb = frames_b.load(std::memory_order_relaxed);
+      std::uint64_t fc = frames_c.load(std::memory_order_relaxed);
+      std::uint64_t ba = bytes_a.load(std::memory_order_relaxed);
+      std::uint64_t bb = bytes_b.load(std::memory_order_relaxed);
+      std::uint64_t bc = bytes_c.load(std::memory_order_relaxed);
+      std::uint64_t polls = polls_ok.load(std::memory_order_relaxed);
+      std::uint64_t coal = coal_windows.load(std::memory_order_relaxed);
+      std::uint64_t qbusy = q_busy_hits.load(std::memory_order_relaxed);
+      std::uint64_t plc = h.plc->emits();
+      std::uint64_t hmi = h.hmi->emits();
+      std::uint64_t go_n = h.plc->go_true_count();
+
+      bool go = false, nogo = false, dent = false, spike = false, line_ok = false;
+      double fault = 0.0, thick_mean = 0.0, pos_mm = 0.0;
+      double age_a_ms = 0.0, age_b_ms = 0.0, age_c_ms = 0.0;
+      std::size_t coal_pending = 0;
+      {
+        std::lock_guard<std::mutex> lock(arm_mu);
+        go = h.plc->last_go();
+        nogo = h.plc->last_nogo();
+        dent = h.latch_b->b2();
+        spike = h.latch_a->b2();
+        line_ok = h.latch_c->line_ok();
+        thick_mean = h.latch_a->s0();
+        pos_mm = h.latch_c->pos_mm();
+        coal_pending = h.coal_a->pending_frames();
+        double t_now_lit = 0.0;
+        if (auto* tn = h.fusion_node->find_input("t_now");
+            tn && std::holds_alternative<double>(tn->literal)) {
+          t_now_lit = std::get<double>(tn->literal);
+        }
+        age_a_ms = (t_now_lit - h.latch_a->t_stamp()) * 1e3;
+        age_b_ms = (t_now_lit - h.latch_b->t_stamp()) * 1e3;
+        age_c_ms = (t_now_lit - h.latch_c->t_stamp()) * 1e3;
+        auto* fo = flat.find_node("fusion")->find_output("fault_code");
+        if (fo && std::holds_alternative<double>(fo->buffer)) {
+          fault = std::get<double>(fo->buffer);
+        }
+      }
+
+      double go_pct_i =
+          (plc > plc0) ? (100.0 * static_cast<double>(go_n - go0) / static_cast<double>(plc - plc0))
+                       : 0.0;
+
+      std::cout << std::setprecision(0);
+      std::cout << "[" << std::setw(5) << wall << "s]\n";
+      std::cout << "  INPUT inst  A " << std::setw(6) << rate(ea - ea0, d_int) << " emit/s  "
+                << std::setw(6) << rate(fa - fa0, d_int) << " frame/s  "
+                << std::setprecision(3) << std::setw(6) << mib_s(ba - ba0, d_int) << " MB/s"
+                << "   B " << std::setprecision(0) << std::setw(6) << rate(eb - eb0, d_int)
+                << " emit/s  " << std::setw(6) << rate(fb - fb0, d_int) << " frame/s  "
+                << std::setprecision(3) << std::setw(6) << mib_s(bb - bb0, d_int) << " MB/s"
+                << "   C " << std::setprecision(0) << std::setw(6) << rate(ec - ec0, d_int)
+                << " emit/s  " << std::setw(6) << rate(fc - fc0, d_int) << " frame/s  "
+                << std::setprecision(3) << std::setw(6) << mib_s(bc - bc0, d_int) << " MB/s\n";
+      std::cout << "  INPUT avg   A " << std::setprecision(0) << std::setw(6) << rate(ea, wall)
+                << " emit/s  " << std::setw(6) << rate(fa, wall) << " frame/s  "
+                << std::setprecision(3) << std::setw(6) << mib_s(ba, wall) << " MB/s"
+                << "   B " << std::setprecision(0) << std::setw(6) << rate(eb, wall)
+                << " emit/s  " << std::setw(6) << rate(fb, wall) << " frame/s  "
+                << std::setprecision(3) << std::setw(6) << mib_s(bb, wall) << " MB/s"
+                << "   C " << std::setprecision(0) << std::setw(6) << rate(ec, wall)
+                << " emit/s  " << std::setw(6) << rate(fc, wall) << " frame/s  "
+                << std::setprecision(3) << std::setw(6) << mib_s(bc, wall) << " MB/s\n";
+
+      double in_mib_i = mib_s((ba - ba0) + (bb - bb0) + (bc - bc0), d_int);
+      double in_mib_a = mib_s(ba + bb + bc, wall);
+      std::cout << "  GRAPH       poll " << std::setprecision(0) << std::setw(7)
+                << rate(polls - polls0, d_int) << " Hz (avg " << std::setw(7) << rate(polls, wall)
+                << ")  coal_win " << std::setw(5) << rate(coal - coal0, d_int) << " Hz"
+                << "  pending_frames " << coal_pending
+                << "  in_payload " << std::setprecision(3) << in_mib_i << " / avg " << in_mib_a
+                << " MB/s  q_nonempty_sightings/s " << std::setprecision(0)
+                << rate(qbusy - qbusy0, d_int) << '\n';
+
+      std::cout << "  KEY NODES   fusion go=" << (go ? 1 : 0) << " nogo=" << (nogo ? 1 : 0)
+                << " fault=" << std::setprecision(0) << fault
+                << " age_ms A/B/C=" << std::setprecision(1) << age_a_ms << '/' << age_b_ms << '/'
+                << age_c_ms << " | thick mean=" << std::setprecision(3) << thick_mean
+                << " spike=" << (spike ? 1 : 0) << " | dist dent=" << (dent ? 1 : 0)
+                << " | enc line_ok=" << (line_ok ? 1 : 0) << " pos_mm=" << std::setprecision(1)
+                << pos_mm << '\n';
+
+      std::cout << "  SINKS       plc " << std::setprecision(0) << std::setw(7)
+                << rate(plc - plc0, d_int) << " Hz  hmi " << std::setw(7)
+                << rate(hmi - hmi0, d_int) << " Hz  go_true " << std::setw(3)
+                << go_pct_i << "% this interval  mes_events=" << h.mes->events() << "\n\n";
+
+      t_last = now;
+      ea0 = ea;
+      eb0 = eb;
+      ec0 = ec;
+      fa0 = fa;
+      fb0 = fb;
+      fc0 = fc;
+      ba0 = ba;
+      bb0 = bb;
+      bc0 = bc;
+      polls0 = polls;
+      coal0 = coal;
+      qbusy0 = qbusy;
+      plc0 = plc;
+      hmi0 = hmi;
+      go0 = go_n;
     }
+
     run.store(false, std::memory_order_relaxed);
     ta.join();
     tb.join();
     tc.join();
-    // Drain remaining
     {
       std::lock_guard<std::mutex> lock(arm_mu);
       while (engine.poll_trigger_and_run(flat)) {
+        polls_ok.fetch_add(1, std::memory_order_relaxed);
+        auto* ready = flat.find_node("coal_a")->find_output("ready");
+        if (ready && std::holds_alternative<bool>(ready->buffer) &&
+            std::get<bool>(ready->buffer)) {
+          coal_windows.fetch_add(1, std::memory_order_relaxed);
+        }
       }
     }
 
     double wall = std::chrono::duration<double>(clock::now() - t0).count();
-    auto hz = [&](std::uint64_t n) {
-      return wall > 0.0 ? static_cast<double>(n) / wall : 0.0;
-    };
-    std::cout << std::fixed << std::setprecision(1);
-    std::cout << "wall_s=" << wall << " emit_hz A/B/C=" << hz(emits_a.load()) << '/'
-              << hz(emits_b.load()) << '/' << hz(emits_c.load()) << " frame_hz A/B/C="
-              << hz(frames_a.load()) << '/' << hz(frames_b.load()) << '/' << hz(frames_c.load())
-              << " non_empty_polls~=" << q_hwm.load() << " plc_emits=" << h.plc->emits() << '\n';
+    std::uint64_t ea = emits_a.load();
+    std::uint64_t eb = emits_b.load();
+    std::uint64_t ec = emits_c.load();
+    std::uint64_t fa = frames_a.load();
+    std::uint64_t fb = frames_b.load();
+    std::uint64_t fc = frames_c.load();
+    std::uint64_t ba = bytes_a.load();
+    std::uint64_t bb = bytes_b.load();
+    std::uint64_t bc = bytes_c.load();
+    std::uint64_t polls = polls_ok.load();
+    std::uint64_t coal = coal_windows.load();
+    std::uint64_t plc = h.plc->emits();
+    std::uint64_t hmi = h.hmi->emits();
+    std::uint64_t go_n = h.plc->go_true_count();
+
+    std::cout << "=== Phase B summary (" << std::setprecision(1) << wall << "s wall) ===\n";
+    std::cout << "INPUT totals  A emits=" << ea << " frames=" << fa << "  "
+              << std::setprecision(2) << mib_s(ba, wall) << " MB/s avg | B emits=" << eb
+              << " frames=" << fb << "  " << mib_s(bb, wall) << " MB/s avg | C emits=" << ec
+              << " frames=" << fc << "  " << mib_s(bc, wall) << " MB/s avg\n";
+    std::cout << "INPUT rates   A " << std::setprecision(1) << rate(ea, wall) << " emit/s "
+              << rate(fa, wall) << " frame/s | B " << rate(eb, wall) << " emit/s "
+              << rate(fb, wall) << " frame/s | C " << rate(ec, wall) << " emit/s "
+              << rate(fc, wall) << " frame/s\n";
+    std::cout << "PAYLOAD avg   total in "
+              << std::setprecision(2) << mib_s(ba + bb + bc, wall) << " MB/s  ("
+              << std::setprecision(1) << (static_cast<double>(ba + bb + bc) / (1024.0 * 1024.0))
+              << " MiB moved)\n";
+    std::cout << "GRAPH         poll " << std::setprecision(1) << rate(polls, wall)
+              << " Hz  coal windows=" << coal << " (" << rate(coal, wall) << " Hz)  "
+              << "q_nonempty_hits=" << q_busy_hits.load() << '\n';
+    std::cout << "SINKS         plc " << rate(static_cast<std::uint64_t>(plc), wall) << " Hz  hmi "
+              << rate(static_cast<std::uint64_t>(hmi), wall) << " Hz  go_true "
+              << (plc ? (100.0 * static_cast<double>(go_n) / static_cast<double>(plc)) : 0.0)
+              << "%  mes_events=" << h.mes->events() << "  last_go=" << (h.plc->last_go() ? 1 : 0)
+              << " last_nogo=" << (h.plc->last_nogo() ? 1 : 0) << '\n';
     std::cout << std::defaultfloat;
-    if (emits_a.load() == 0 || emits_b.load() == 0 || emits_c.load() == 0) {
+
+    if (ea == 0 || eb == 0 || ec == 0) {
       return fail("async producers produced zero emits");
     }
   }
