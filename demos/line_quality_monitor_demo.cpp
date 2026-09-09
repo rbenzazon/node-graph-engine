@@ -361,12 +361,13 @@ struct RunResult {
 
 RunResult run_scenario(Engine& engine, FlatGraph& flat, Handles& h, std::size_t K_thick,
                        bool do_stale_c_test) {
-  // Rings large enough for scenario.
-  constexpr std::size_t kN = 4000;
-  constexpr std::size_t kSpike = 200;
-  constexpr std::size_t kDent = 150;
-  constexpr std::size_t kStop0 = 800;
-  constexpr std::size_t kStopN = 40;
+  // Plants must fall inside t_end at each edge's frame rate.
+  // A @ 20 kHz, B @ 7 kHz, C @ 2 kHz; stop ~40 ms on C, spike ~5 ms on A, dent ~8 ms on B.
+  constexpr std::size_t kN = 8000;
+  constexpr std::size_t kSpike = 100;   // t≈5.0 ms @ 20 kHz
+  constexpr std::size_t kDent = 56;     // t≈8.0 ms @ 7 kHz
+  constexpr std::size_t kStop0 = 80;    // t≈40 ms @ 2 kHz
+  constexpr std::size_t kStopN = 40;    // 20 ms stop gap
 
   Ring ring_a = make_thickness_ring(kN, kSpike);
   Ring ring_b = make_distance_ring(kN, kDent);
@@ -386,14 +387,15 @@ RunResult run_scenario(Engine& engine, FlatGraph& flat, Handles& h, std::size_t 
   h.mes->reset_counts();
 
   RunResult rr;
-  double t_end = 0.12;  // 120 ms virtual
+  double t_end = 0.10;  // 100 ms virtual — covers spike, dent, stop
   double t_now = 0.0;
 
   // Prime each branch once so fusion LKG inputs are valid (multi-root, staggered start).
   {
+    std::size_t k0 = ca.K;
     auto ba = pull_emit(ring_a, ca);
-    arm_and_run(engine, flat, h, "edge_thick", h.edge_thick, std::move(ba), 0.0, ca.K, 0.0);
-    ca.t_frame = static_cast<double>(ca.K) * ca.period;
+    arm_and_run(engine, flat, h, "edge_thick", h.edge_thick, std::move(ba), 0.0, k0, 0.0);
+    ca.t_frame = static_cast<double>(k0) * ca.period;
     auto bb = pull_emit(ring_b, cb);
     arm_and_run(engine, flat, h, "edge_dist", h.edge_dist, std::move(bb), 0.0, 1, 0.0);
     cb.t_frame = cb.period;
@@ -401,8 +403,11 @@ RunResult run_scenario(Engine& engine, FlatGraph& flat, Handles& h, std::size_t 
     arm_and_run(engine, flat, h, "edge_enc", h.edge_enc, std::move(bc), 0.0, 1, 0.0);
     cc.t_frame = cc.period;
     t_now = 0.0;
-    rr.frames_a += ca.K;
+    rr.frames_a += k0;
     ++rr.emits_a;
+    if (h.plc->last_go()) {
+      rr.saw_go_true = true;
+    }
   }
 
   // Event queue: next deadline per edge.
@@ -410,54 +415,56 @@ RunResult run_scenario(Engine& engine, FlatGraph& flat, Handles& h, std::size_t 
   double next_b = cb.t_frame;
   double next_c = cc.t_frame;
 
-  auto step_edge = [&](char const* id, FrameEdgeSource* edge, Ring const& ring, EmitCursor& cur,
-                       double& next_deadline) {
-    if (cur.index >= ring.frames) {
+  auto step_edge = [&](std::string const& id, FrameEdgeSource* edge, Ring const& ring,
+                       EmitCursor& cur, double& next_deadline) {
+    if (cur.index + cur.K > ring.frames) {
       next_deadline = 1e100;
       return;
     }
     double t0 = cur.t_frame;
     auto buf = pull_emit(ring, cur);
     std::size_t K = cur.K;
-    // last frame time in emit approx t0 + (K-1)*period; advance cursor time by K*period
     cur.t_frame += static_cast<double>(K) * cur.period;
     next_deadline = cur.t_frame;
-    t_now = std::max(t_now, t0 + static_cast<double>(K - 1) * cur.period);
-    arm_and_run(engine, flat, h, id, edge, std::move(buf), t0, K, t_now);
+    // Consumer "now" is at least the last frame time in this emit.
+    t_now = std::max(t_now, t0 + static_cast<double>(K > 0 ? K - 1 : 0) * cur.period);
+    arm_and_run(engine, flat, h, id.c_str(), edge, std::move(buf), t0, K, t_now);
 
-    if (id[6] == 't') {  // edge_thick
+    if (id == "edge_thick") {
       rr.frames_a += K;
       ++rr.emits_a;
-      if (out_bool(*flat.find_node("rules_a"), "spike")) {
+      if (out_bool(*flat.find_node("rules_a"), "spike") || h.latch_a->b2()) {
         rr.saw_spike = true;
       }
       auto* ready = flat.find_node("coal_a")->find_output("ready");
       if (ready && std::holds_alternative<bool>(ready->buffer) && std::get<bool>(ready->buffer)) {
         ++rr.coal_ready;
       }
-    }
-    if (id[6] == 'd') {
-      if (out_bool(*flat.find_node("rules_b"), "dent")) {
+    } else if (id == "edge_dist") {
+      if (out_bool(*flat.find_node("rules_b"), "dent") || h.latch_b->b2()) {
         rr.saw_dent = true;
       }
+    } else if (id == "edge_enc") {
+      if (!h.latch_c->line_ok()) {
+        // Encoder stop gap (or other motion fail) while geometry may still be fresh.
+        if (!h.plc->last_go()) {
+          rr.saw_go_false_on_stop = true;
+        }
+      }
     }
+
     if (h.plc->last_go()) {
       rr.saw_go_true = true;
     }
-    if (!h.latch_c->line_ok() && !h.plc->last_go()) {
-      // stop gap region
-      if (cc.index > kStop0 && cc.index < kStop0 + kStopN + 5) {
-        rr.saw_go_false_on_stop = true;
-      }
-    }
   };
 
-  while (t_now < t_end && (ca.index < ring_a.frames || cb.index < ring_b.frames ||
-                           cc.index < ring_c.frames)) {
+  while (true) {
     double n = std::min({next_a, next_b, next_c});
-    if (n > 1e50) {
+    if (n > 1e50 || n > t_end) {
       break;
     }
+    // Drive virtual time to the next sensor deadline before processing it.
+    t_now = std::max(t_now, n);
     if (n == next_a) {
       step_edge("edge_thick", h.edge_thick, ring_a, ca, next_a);
     } else if (n == next_b) {
@@ -471,18 +478,19 @@ RunResult run_scenario(Engine& engine, FlatGraph& flat, Handles& h, std::size_t 
   if (do_stale_c_test) {
     double t_c_last = h.latch_c->t_stamp();
     double stale_c = 0.015;
-    // Advance only A a few times with t_now far past t_c.
     for (int i = 0; i < 5; ++i) {
-      if (ca.index >= ring_a.frames) {
+      if (ca.index + ca.K > ring_a.frames) {
         break;
       }
       double t0 = ca.t_frame;
       auto buf = pull_emit(ring_a, ca);
-      ca.t_frame += static_cast<double>(ca.K) * ca.period;
+      std::size_t K = ca.K;
+      ca.t_frame += static_cast<double>(K) * ca.period;
       t_now = t_c_last + stale_c + 0.005 + static_cast<double>(i) * 0.001;
-      arm_and_run(engine, flat, h, "edge_thick", h.edge_thick, std::move(buf), t0, ca.K, t_now);
-      // Also refresh B so only C is stale.
-      if (cb.index < ring_b.frames) {
+      arm_and_run(engine, flat, h, "edge_thick", h.edge_thick, std::move(buf), t0, K, t_now);
+      rr.frames_a += K;
+      ++rr.emits_a;
+      if (cb.index + cb.K <= ring_b.frames) {
         double tb = cb.t_frame;
         auto bb = pull_emit(ring_b, cb);
         cb.t_frame += cb.period;
@@ -616,7 +624,8 @@ int main() {
   }
 
   // --- Phase B light: free-run async producers, measure emit rates ---
-  std::cout << "\n--- Phase B light (async producers, ~50ms wall) ---\n";
+  constexpr double kPhaseBWallS = 60.0;
+  std::cout << "\n--- Phase B light (async producers, ~" << kPhaseBWallS << "s wall) ---\n";
   {
     Ring ring_a = make_thickness_ring(20000, 99999);
     Ring ring_b = make_distance_ring(20000, 99999);
@@ -667,7 +676,7 @@ int main() {
                    &frames_c);
 
     auto t0 = clock::now();
-    while (std::chrono::duration<double>(clock::now() - t0).count() < 0.05) {
+    while (std::chrono::duration<double>(clock::now() - t0).count() < kPhaseBWallS) {
       bool ran = false;
       {
         std::lock_guard<std::mutex> lock(arm_mu);

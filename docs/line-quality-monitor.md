@@ -667,7 +667,7 @@ Three **separate input edge nodes** (thickness, distance, encoder) each own a re
 | Item | Status |
 |------|--------|
 | Design (this doc) | **Done** |
-| Demo code | **Not started** |
-| Doc entry in [demo.md](demo.md) | Add when binary lands |
+| Demo code | **Done** — [`demos/line_quality_monitor_demo.cpp`](../demos/line_quality_monitor_demo.cpp), nodes in [`nodes/line_quality/`](../nodes/line_quality/) |
+| Doc entry in [demo.md](demo.md) | **Done** — section 8 |
 
-When implementing, extend [demo.md](demo.md) with purpose, diagram, expected behavior, and measured results in the same style as the insight demos.
+Phase A (multi-root, K=1/K=10 dual format, spike/dent/stop/stale, coalescer) and light Phase B async producers exit `0` on Debug MSVC.
