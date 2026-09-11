@@ -25,21 +25,27 @@ void GraphNode::rebuild_ports_from_blueprint() {
     if (named.node->role() == Role::BoundaryIn) {
       // Outer input port name = boundary node id. Type from first boundary output.
       TypeId t = TypeId::Dynamic;
+      std::string tk;
       if (!named.node->outputs.empty()) {
         t = named.node->outputs.front().type;
+        tk = named.node->outputs.front().type_key;
       }
       Pin p;
       p.id = named.id;
       p.type = t;
+      p.type_key = std::move(tk);
       inputs.push_back(std::move(p));
     } else if (named.node->role() == Role::BoundaryOut) {
       TypeId t = TypeId::Dynamic;
+      std::string tk;
       if (!named.node->inputs.empty()) {
         t = named.node->inputs.front().type;
+        tk = named.node->inputs.front().type_key;
       }
       Pin p;
       p.id = named.id;
       p.type = t;
+      p.type_key = std::move(tk);
       outputs.push_back(std::move(p));
     }
   }

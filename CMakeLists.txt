@@ -17,6 +17,7 @@ option(NODE_ENGINE_BUILD_TESTS "Build tests" ON)
 include(cmake/Dependencies.cmake)
 
 add_library(node_engine
+  src/converter_registry.cpp
   src/engine.cpp
   src/factory.cpp
   src/flatten.cpp
@@ -26,6 +27,7 @@ add_library(node_engine
   src/register_builtin_nodes.cpp
   src/scheduler.cpp
   src/trigger_queue.cpp
+  src/type_registry.cpp
 )
 
 add_library(node_engine::node_engine ALIAS node_engine)

@@ -1,5 +1,7 @@
 #include "node_engine/scheduler.hpp"
 
+#include "node_engine/converter_registry.hpp"
+
 #include <algorithm>
 #include <string>
 #include <thread>
@@ -37,9 +39,20 @@ void copy_inbound_edges(FlatGraph& graph, std::string const& node_id) {
       continue;
     }
     Value src = out_pin->buffer;
-    if (in_pin->type != TypeId::Dynamic && type_of(src) != TypeId::Dynamic &&
-        type_of(src) != in_pin->type && can_autoconvert(type_of(src), in_pin->type)) {
-      src = autoconvert(src, in_pin->type);
+    std::string from_key = value_type_key(src);
+    if (from_key.empty() || from_key == builtin_type_key(TypeId::Dynamic)) {
+      from_key = pin_type_key(out_pin->type, out_pin->type_key);
+    }
+    std::string to_key = pin_type_key(in_pin->type, in_pin->type_key);
+    TypeId have = type_of(src);
+    if (in_pin->type != TypeId::Dynamic && have != TypeId::Dynamic && from_key != to_key) {
+      if (types_compatible(from_key, to_key, have, in_pin->type)) {
+        src = apply_converter(src, from_key, to_key);
+      }
+    } else if (from_key == to_key && have == TypeId::Object) {
+      src = clone_value(src);
+    } else {
+      src = clone_value(src);
     }
     in_pin->buffer = std::move(src);
     in_pin->connected = true;

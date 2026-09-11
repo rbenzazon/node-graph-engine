@@ -1,7 +1,9 @@
+#include "node_engine/converter_registry.hpp"
 #include "node_engine/engine.hpp"
 #include "node_engine/factory.hpp"
 #include "node_engine/graph.hpp"
 #include "node_engine/graph_node.hpp"
+#include "node_engine/type_registry.hpp"
 #include "node_engine/value.hpp"
 
 #include "boundary.hpp"
@@ -11,9 +13,11 @@
 #include "examples/producer_consumer.hpp"
 #include "examples/scale_filter.hpp"
 
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <vector>
 
 namespace {
 
@@ -22,23 +26,94 @@ int fail(char const* msg) {
   return EXIT_FAILURE;
 }
 
+using namespace node_engine;
+
+struct SensorSample {
+  double t_s = 0;
+  double value = 0;
+};
+
+struct SampleBatch {
+  std::vector<double> values;
+};
+
+struct OtherStruct {
+  int x = 0;
+};
+
+struct SampleSource : NodeBase<SampleSource> {
+  static constexpr Meta meta{.type_id = "test.sample_source", .role = Role::Producer};
+  static void ports(Ports& p) { p.out<SensorSample>("out"); }
+  void compute(Slice) override {
+    set_out("out", SensorSample{1.5, 3.0});
+    suppress();
+  }
+};
+
+struct BatchSink : NodeBase<BatchSink> {
+  static constexpr Meta meta{.type_id = "test.batch_sink", .role = Role::Consumer};
+  SampleBatch last{};
+  static void ports(Ports& p) { p.in<SampleBatch>("in"); }
+  void compute(Slice) override {
+    last = get<SampleBatch>("in");
+    suppress();
+  }
+};
+
+struct OtherSink : NodeBase<OtherSink> {
+  static constexpr Meta meta{.type_id = "test.other_sink", .role = Role::Consumer};
+  static void ports(Ports& p) { p.in<OtherStruct>("in"); }
+  void compute(Slice) override { suppress(); }
+};
+
+struct IntSource : NodeBase<IntSource> {
+  static constexpr Meta meta{.type_id = "test.int_source", .role = Role::Producer};
+  static void ports(Ports& p) { p.out<std::int32_t>("out"); }
+  void compute(Slice) override {
+    set_out<std::int32_t>("out", 7);
+    suppress();
+  }
+};
+
+struct IntSink : NodeBase<IntSink> {
+  static constexpr Meta meta{.type_id = "test.int_sink", .role = Role::Consumer};
+  std::int32_t last = 0;
+  static void ports(Ports& p) { p.in<std::int32_t>("in"); }
+  void compute(Slice) override {
+    last = get<std::int32_t>("in");
+    suppress();
+  }
+};
+
 }  // namespace
 
 int main() {
   using namespace node_engine;
   using namespace node_engine::nodes;
 
-  // Value / autoconvert
+  // Value / builtin converters (Bool↔Float64; Float alias = Float64)
   Value v = 1.0;
   if (!std::holds_alternative<double>(v)) {
     return fail("Value variant");
   }
-  if (!can_autoconvert(TypeId::Bool, TypeId::Float)) {
+  if (!can_autoconvert(TypeId::Bool, TypeId::Float) ||
+      !can_autoconvert(TypeId::Bool, TypeId::Float64)) {
     return fail("autoconvert table");
   }
   Value b = autoconvert(Value{true}, TypeId::Float);
   if (std::get<double>(b) != 1.0) {
     return fail("bool->float convert");
+  }
+  if (!can_autoconvert(TypeId::Float32, TypeId::Float64)) {
+    return fail("float32->float64 converter missing");
+  }
+  Value f32 = autoconvert(Value{2.5f}, TypeId::Float64);
+  if (std::get<double>(f32) != 2.5) {
+    return fail("float32->float64 convert");
+  }
+  // Fail-closed: no int8→uint8 builtin
+  if (can_autoconvert(TypeId::Int8, TypeId::Uint8)) {
+    return fail("int8->uint8 should not autoconvert");
   }
 
   // Factory registration
@@ -190,6 +265,55 @@ int main() {
     auto* c = dynamic_cast<BufferConsumer*>(flat.find_node("c"));
     if (!c || c->last().size() != 2) {
       return fail("trigger run");
+    }
+  }
+
+  // Object struct pins + direct converter (no multi-hop)
+  {
+    register_type<SensorSample>("test.SensorSample");
+    register_type<SampleBatch>("test.SampleBatch");
+    register_type<OtherStruct>("test.OtherStruct");
+    register_converter<SensorSample, SampleBatch>(
+        "test.sample_to_batch", [](SensorSample const& in, SampleBatch& out) {
+          out.values = {in.t_s, in.value};
+        });
+
+    Graph ok;
+    ok.add_node("src", std::make_unique<SampleSource>());
+    ok.add_node("snk", std::make_unique<BatchSink>());
+    ok.connect("src", "out", "snk", "in");
+    auto ok_errs = validate_graph(ok);
+    if (!ok_errs.empty()) {
+      return fail(ok_errs.front().message.c_str());
+    }
+    FlatGraph flat = engine.run_once(ok);
+    auto* snk = dynamic_cast<BatchSink*>(flat.find_node("snk"));
+    if (!snk || snk->last.values.size() != 2 || snk->last.values[0] != 1.5 ||
+        snk->last.values[1] != 3.0) {
+      return fail("object converter pipeline");
+    }
+
+    // No direct converter SensorSample → OtherStruct
+    Graph bad;
+    bad.add_node("src", std::make_unique<SampleSource>());
+    bad.add_node("snk", std::make_unique<OtherSink>());
+    bad.connect("src", "out", "snk", "in");
+    auto bad_errs = validate_graph(bad);
+    if (bad_errs.empty()) {
+      return fail("expected incompatible object wire error");
+    }
+  }
+
+  // Int32 pin roundtrip via identity
+  {
+    Graph g;
+    g.add_node("s", std::make_unique<IntSource>());
+    g.add_node("k", std::make_unique<IntSink>());
+    g.connect("s", "out", "k", "in");
+    FlatGraph flat = engine.run_once(g);
+    auto* k = dynamic_cast<IntSink*>(flat.find_node("k"));
+    if (!k || k->last != 7) {
+      return fail("int32 identity wire");
     }
   }
 

@@ -1,9 +1,39 @@
-# Line quality monitor — real-world graph design
+# Line quality monitor — typed multi-root design
 
-Design-only specification for a future demo (not implemented yet).  
-Target binary name (suggested): `demos/line_quality_monitor_demo`.
+Implemented demo: [`demos/line_quality_monitor_demo.cpp`](../demos/line_quality_monitor_demo.cpp).  
+Nodes: [`nodes/line_quality/`](../nodes/line_quality/) (`lq_*` typed headers + legacy FloatBuffer nodes kept for reference).  
+Short summary: [demo.md §8](demo.md). Related: [type-system-converters.md](type-system-converters.md), [initial-specs.md](initial-specs.md).
 
-Related engine docs: [initial-specs.md](initial-specs.md), [demo.md](demo.md).
+---
+
+## 0. Current implementation (shipped)
+
+| Item | Value |
+|------|--------|
+| Binary | `line_quality_monitor_demo` |
+| Session | `Engine{4}`; `compile` once; `TriggerQueue` + `poll_trigger_and_run` per edge |
+| Payloads | `ChannelChunkI16` / `ChannelChunkF32`, `EncoderRawI16` / `EncoderPoseF32`, `FrameFeaturesF32` |
+| Converters (direct only) | I16 milli-units → F32 mm (`×1/1000`); encoder counts → mm (`/100`) |
+| Branching | `CompareScalar` (**separate** `op` + `operand` pins) + `AndBool` + `RouteFeatures` |
+| Const params | Unwired pin **literals** (e.g. GE/1.90, LE/2.10) |
+| Harness | Virtual-time multi-rate event queue (~20 / 7 / 2 kHz frames); prebuilt I16/raw rings |
+| Asserts | multi-root, validate+converters, spike/route_fault, dent, go true, go false stop, go false stale-C |
+| Exit | `demo ok` (exit 0) |
+
+**Topology implemented**
+
+```text
+edge_thick (I16) -[conv]-> cal_a -> ema_a -> stats_a -mean-> cmp_lo & cmp_hi -> thick_and
+                                                   features -----------------> route.data
+                                                   thick_and.pass -----------> route.sel
+                                                   thick_and + mean + t -----> latch_ok
+                                                   route.b ------------------> latch_fault
+edge_dist  (I16) -[conv]-> cal_b -> dent_b -> latch_b
+edge_enc   (raw) -[conv]-> motion_c -> latch_c
+latch_ok + latch_b + latch_c -> fusion_simple -> edge_plc
+```
+
+Legacy `frame_*` / `FloatBuffer` LQM nodes remain under `nodes/line_quality/` but are **not** the active demo path.
 
 ---
 
@@ -11,21 +41,21 @@ Related engine docs: [initial-specs.md](initial-specs.md), [demo.md](demo.md).
 
 Model **inline multi-sensor production-line quality monitoring**:
 
-| Role | Real-world meaning |
-|------|--------------------|
-| Emitter A | **Laser thickness / gap array** (24 spots across web or part width) |
-| Emitter B | **Distance / runout / height array** (24 probes or multipoint TOF) |
-| Emitter C | **Encoder + motion auxiliaries** (position, speed, flags packed as 24×f32) |
+| Role | Real-world meaning | Typed demo payload |
+|------|--------------------|--------------------|
+| Emitter A | **Laser thickness / gap array** (24 spots) | `ChannelChunkI16` → F32 mm |
+| Emitter B | **Distance / height array** (24 probes) | `ChannelChunkI16` → F32 mm |
+| Emitter C | **Encoder + motion** | `EncoderRawI16` → `EncoderPoseF32` |
 
-**Constraints**
+**Constraints (design + demo)**
 
-- Channel layout: **24 × f32 per frame** per emitter.
-- Each physical source is its own **input edge node** and heads **its own input branch** (no shared intake choke point — see §2 / §6).
-- Input edges emit **sample** (`K=1` frame) or **chunk** (`K>1` frames) as one `FloatBuffer` (`24×K`); branch nodes use **one compute model** for both (see §4 / §4b).
-- ~**20 kHz** is a **rough average / capacity hint** for the fastest branch’s **frame** rate (thickness), **not** a global lockstep clock or a fixed emit rate.
-- Sensors are **desynced**: different frame rates, emit batching, jitter, and independent edge triggers.
-- Input data is **prebuilt once** and **replayed** (ring buffers) so metrics are not biased by allocation or file I/O.
-- Output edge nodes **fake** external network apps (PLC, MES, SCADA, logger, HMI). No real sockets in v1.
+- Geometry: **24 channels per frame**; rings store I16 **milli-units**; engineering units after edge converter.
+- Each physical source is its own **input edge node** and heads **its own input branch** (no shared intake choke point — §2).
+- Sensors are **desynced**: independent frame rates and edge triggers (virtual-time harness).
+- Input data is **prebuilt once** and **replayed** (per-edge rings).
+- Output edge **fakes** a PLC go/nogo sink in v1 (MES/HMI optional later). No real sockets.
+- Decision params are **separate pins** (never bundle `op`+`operand`); const via unwired literals.
+- Converters are **direct pairs only** (no multi-hop).
 
 ---
 
@@ -40,226 +70,134 @@ Model **inline multi-sensor production-line quality monitoring**:
 | Harness writes all rings into one bus pin / one seed id | Same choke point outside the graph |
 | Fusion assumes same frame index `i` | Features arrive staggered; alignment is explicit (LKG) |
 
-### Required shape
+### Required shape (implemented)
 
 ```text
-  Edge_Thickness ──► Branch A (cal…latch) ──────────┐
-  Edge_Distance  ──► Branch B (cal…latch) ───────┐  │
-  Edge_Encoder   ──► Branch C (decode…latch) ──┐ │  │
-                                              │ │  │
-                                              ▼ ▼  ▼
-                                         Fusion (join) ─► Output edges
+  edge_thick (I16) ──[conv]──► Branch A (cal…compare…route…latch) ──┐
+  edge_dist  (I16) ──[conv]──► Branch B (cal…dent…latch) ────────┐  │
+  edge_enc   (raw) ──[conv]──► Branch C (motion…latch) ────────┐ │  │
+                                                              │ │  │
+                                                              ▼ ▼  ▼
+                                                     Fusion (late join) ─► edge_plc
 ```
 
 | Rule | Detail |
 |------|--------|
-| **One edge node per source** | `edge_thick`, `edge_dist`, `edge_enc` are distinct authoring nodes (`Role::Producer` / input edge) |
-| **Own input branch** | Wires from that edge only into that source’s transformers; **no** wire from edge A into branch B |
-| **Multi-root graph** | The compiled flat graph has **three (or more) roots**, not one upstream funnel |
-| **Trigger seed = edge node id** | `push("edge_thick")` → `mark_dirty_reachable(flat, "edge_thick")` dirty-cones **that branch** (+ anything downstream of its latch, e.g. fusion if wired) |
-| **Join only where physics joins** | Fusion (and optional multi-input SCADA/HMI) are the intentional multi-input nodes — **late** in the graph, not at the sensors |
-| **Harness is not a graph node** | Producer threads only arm **one** edge’s pins/ring cursor and push **that** edge’s id; they do not merge payloads |
+| **One edge node per source** | `ThickEdgeSourceI16`, `DistEdgeSourceI16`, `EncEdgeSourceRaw` — distinct producers |
+| **Own input branch** | Wires from that edge only into that source’s transformers |
+| **Multi-root graph** | Three roots; no inbound wires to edges |
+| **Trigger seed = edge node id** | `push("edge_thick")` dirties that branch (+ fusion if reachable) |
+| **Join only where physics joins** | `LqFusionSimple` is the late multi-input node |
+| **Harness is not a graph node** | Demo arms one edge’s emit buffer and pushes that edge id |
 
-Shop floor: each DAQ / fieldbus / encoder card is a separate cable into the cabinet. The graph mirrors that: **separate edges, separate branches**, shared executor/session only.
-
-The runtime is still one session `Engine` / `tf::Executor` and one FIFO `TriggerQueue` for wake ordering — that is **scheduling**, not a data choke point. Payloads never meet until an explicit multi-input node.
+Shop floor: each DAQ / encoder card is a separate cable. The graph mirrors that. One session `Engine` / `TriggerQueue` multiplexes **wakeups** only — not sensor data.
 
 ---
 
-## 3. Rate model (tunable defaults)
+## 3. Rate model (demo defaults)
 
 | Edge root | Nominal frame rate | Period | Notes |
 |-----------|--------------------|--------|--------|
-| `edge_thick` | ~20 kHz | ~50 µs | Fastest geometry array; own branch A |
-| `edge_dist` | ~5–10 kHz | ~100–200 µs | Own branch B; often slower multipoint / TOF |
-| `edge_enc` | ~1–4 kHz | ~250 µs–1 ms | Own branch C; may burst on motion |
-| `edge_timer_plc` (optional) | 1 kHz | 1 ms | Separate root; poll latched go/nogo |
-| `edge_timer_scada` (optional) | 50–200 Hz | 5–20 ms | Separate root; downsampled trends |
+| `edge_thick` | ~20 kHz | 50 µs | Fastest geometry; branch A |
+| `edge_dist` | ~7 kHz | ~143 µs | Branch B |
+| `edge_enc` | ~2 kHz | 500 µs | Branch C; stop gap planted |
 
-Add **jitter** on each **edge** producer deadline and occasional **gaps** (line stop, transport hiccup). Rates are per edge — not a shared intake clock.
+Virtual-time harness advances the next edge deadline; rates are per edge — not a shared lockstep clock. Optional timer roots (PLC/SCADA poll) are design-only for later.
 
 ```text
 time ─────────────────────────────────────────────►
 A:  |||||||||||||||||||||||||||||||||  ~20 kHz
-B:  |---|---|---|---|---|---|---|---  ~5–10 kHz
-C:  |---------||        |        |     ~1–2 kHz
+B:  |---|---|---|---|---|---|---|---  ~7 kHz
+C:  |---------||        |        |     ~2 kHz (+ stop gap)
 ```
 
 ---
 
-## 4. Data layout (precompute + replay)
+## 4. Typed data layout (implemented)
 
-### Canonical unit: frame
+### Geometry chunks
 
-One **frame** = one multi-channel sample at one sensor timestamp:
+| Type | Key | Meaning |
+|------|-----|---------|
+| `ChannelChunkI16` | `lq.ChannelChunkI16` | DAQ-style milli-units: `signal_id`, `channels` (24), `t_s`, `samples` (`channels×K`) |
+| `ChannelChunkF32` | `lq.ChannelChunkF32` | Engineering mm after converter / cal |
 
-```text
-frame  :=  24 × f32     // channels 0..23
-```
-
-Rings store frames only (never a separate “scalar” type for geometry branches); **one private ring per input edge**:
-
-```text
-ring_A[N_A][24]   thickness (raw or engineering units)
-ring_B[N_B][24]   distance / height
-ring_C[N_C][24]   encoder pack (see packing below)
-```
-
-### Wire payload: sample **or** chunk, same type
-
-Input **edge** nodes (replay sources) always emit a `FloatBuffer` whose length is a multiple of 24:
-
-| Mode | Buffer length | Meaning | Typical sensor timing |
-|------|---------------|---------|------------------------|
-| **Sample** | `24` | One frame | Per-interrupt / per-sample DAQ |
-| **Chunk** | `24 × K` (`K ≥ 2`) | `K` frames, packed | DMA block, USB bulk, fieldbus packet, USB isoch burst |
-
-**Packing (locked for MVP):** channel-major **within** each frame, frames **contiguous**:
+Packing: channel-major **within** each frame, frames contiguous:
 
 ```text
-[ f0_c0..f0_c23 | f1_c0..f1_c23 | … | fK-1_c0..fK-1_c23 ]
+[ f0_c0..f0_c23 | f1_c0..f1_c23 | … ]
 ```
 
-Helpers (demo or small util):
+Helpers in `lq_types.hpp`: `num_frames`, `frame_ptr`. Demo primary path uses **K=1**; K>1 remains valid on the same types.
 
-```text
-num_frames(buf) = buf.size() / 24      // require size % 24 == 0
-frame_view(buf, i) = buf[i*24 .. i*24+24)
-```
+### Encoder
 
-No second pin type for “chunk vs sample.” Downstream nodes **must not** branch on mode; they only see `K = num_frames(in)` and run the **same** per-frame (and per-channel) math for `K = 1` and `K > 1`.
+| Type | Key | Fields |
+|------|-----|--------|
+| `EncoderRawI16` | `lq.EncoderRawI16` | `t_s`, `x_counts`, `y_counts`, `vel_counts`, `status` |
+| `EncoderPoseF32` | `lq.EncoderPoseF32` | `x_mm`, `y_mm`, `vel_x`, `quality` |
 
-### Encoder channel packing (MVP: uniform 24×f32)
+Scale: counts × `1/100` → mm (and mm/s for velocity).
 
-| Channel | Content |
-|--------:|---------|
-| 0 | position (mm or counts as float) |
-| 1 | velocity |
-| 2 | acceleration (optional derived) |
-| 3 | phase in period `[0,1)` or degrees |
-| 4 | valid / quality flag (0/1) |
-| 5+ | pad / spare auxiliaries |
+### Features / decisions
 
-A dedicated struct pin type can replace this later; uniform buffers match the current engine MVP.
+| Type | Key | Role |
+|------|-----|------|
+| `FrameFeaturesF32` | `lq.FrameFeaturesF32` | `mean`, `min_v`, `max_v`, `p2p` (+ `signal_id`, `t_s`) for routing / fault latch |
 
-### Synthetic truth (for asserts)
+Compare ops are **not** a struct: `CompareScalar` takes `value:float`, `op:int32` (`kOpLT`…`kOpNE`), `operand:float` as **three pins**.
 
-- **Thickness:** base 2.00 mm + slow sine + channel taper + rare **spike**.
-- **Distance:** plane + bow + occasional **dent** on channels 10–12.
-- **Encoder:** ramp position, mostly constant vel, with **stop gaps** to exercise `LineRunning`.
+### Direct converters (`register_lq_demo_converters`)
+
+| From → To | Rule |
+|-----------|------|
+| `ChannelChunkI16` → `ChannelChunkF32` | each sample × `1/1000` (milli → mm) |
+| `EncoderRawI16` → `EncoderPoseF32` | counts × `1/100`; `status` → `quality` |
+
+Applied on **edge copy** at validate/compile when pin type keys differ. No multi-hop.
+
+### Synthetic truth (asserts)
+
+- **Thickness:** base ~2.00 mm + sine + taper + planted **spike** (+0.5 mm) → mean leaves [1.90, 2.10] → `thick_and` fail → `route.b` fault latch.
+- **Distance:** bow + **dent** on channels 10–12 (−0.55 mm) → `LqDentRules.dent`.
+- **Encoder:** run at 10 mm/s then **stop gap** → `line_running` false; later **stale-C** freezes enc while A/B continue.
 
 ---
 
-## 4b. Input edge emission: dual format, one compute model
+## 4b. Input edges and batching
 
-### Why both formats
+### Implemented edge contracts
 
-Shop-floor sources do not all push one interrupt per sample:
+| Node | `out` type | Other outs | Harness API |
+|------|------------|------------|-------------|
+| `ThickEdgeSourceI16` | `ChannelChunkI16` | `t_stamp` | `set_emit(chunk)` |
+| `DistEdgeSourceI16` | `ChannelChunkI16` | `t_stamp` | `set_emit(chunk)` |
+| `EncEdgeSourceRaw` | `EncoderRawI16` | `t_stamp` | `set_emit(raw)` |
 
-| Simulated timing | Edge emit shape | Trigger rate (approx) |
-|------------------|-----------------|------------------------|
-| Fast sample clock | `K=1` each deadline | ~ sensor Hz |
-| Block transfer every `K` samples | one buffer of `K` frames | ~ sensor_Hz / K |
-| Mixed / stress | alternate or configure per **edge/branch** | varies |
+Each edge is a graph root; private ring cursor in the demo harness. Trigger = that node id only.
 
-The **graph** must treat both as the same stream of frames. Coalesce windows, rules, latches, and fusion count **frames** (and time/mm), not “how many times the edge fired.”
+### Sample vs chunk
 
-### Input edge node contract (one node type family, three instances)
+`ChannelChunk*` carry `K = samples.size()/channels` frames. Typed cal/EMA/stats/dent loop over frames the same way for `K=1` and `K>1`. **Shipped demo runs K=1** for clarity; dual-format stress remains a follow-up (legacy FloatBuffer demo had K=1/10 + coalescer).
 
-Each source is a **first-class edge** in the authoring graph, e.g. ids `edge_thick`, `edge_dist`, `edge_enc`. Same node class (or thin aliases), **separate instances**, each wired only into its branch.
-
-| Port / behavior | Contract |
-|-----------------|----------|
-| Role | Input edge / `Producer` — graph root for its branch |
-| `out` (`FloatBuffer`) | Length `24×K`, `K ≥ 1`, packing as above |
-| `frames` / `K` (optional out) | `K` as double/int for diagnostics |
-| `t0` or `t_stamp` | Timestamp of **first** frame in the emit (or per-frame stamps later) |
-| Config `emit_frames` (`K`) | 1 = sample mode; >1 = chunk mode |
-| Config `period_s` | Mean time **per frame** (sensor rate), not per chunk |
-| Ring binding | **Private** to that edge instance (no shared ring cursor across edges) |
-| Trigger | `push(edge_node_id)` only — never a generic `"daq"` seed for all sources |
-
-**Branch wiring (authoring)**
+### Branch wiring (authoring, typed)
 
 ```text
-edge_thick.out → thick_cal.in → … → latch_A → (fusion / sinks)
-edge_dist.out  → dist_cal.in  → … → latch_B → (fusion / sinks)
-edge_enc.out   → enc_decode.in → … → latch_C → (fusion / sinks)
+edge_thick.out -[I16→F32]-> cal_a → ema_a → stats_a → cmp_* → thick_and → latch_ok / route
+edge_dist.out  -[I16→F32]-> cal_b → dent_b → latch_b
+edge_enc.out   -[raw→pose]-> motion_c → latch_c
+latches → fusion → edge_plc
 ```
 
-There is **no** node above the three edges that owns all sensor data. Optional timers (`edge_timer_plc`, `edge_timer_scada`) are additional roots, not parents of the sensor edges.
-
-Pseudo (harness thread **per edge**, not one merged feeder):
+Harness (virtual time, single-threaded demo):
 
 ```text
-// thread dedicated to edge_thick only
-deadline = now
-loop:
-  sleep_until(deadline + jitter)
-  K = emit_frames_thick
-  buf = concat(ring_A[i .. i+K))
-  edge_thick.set_out_buffer(buf)   // or pin write API used by demo
-  triggers.push("edge_thick")      // seed = THIS edge node id
-  deadline += K * period_thick
+pull chunk/raw from ring at cursor
+edge->set_emit(...)
+fusion.t_now = t_virtual
+triggers.push(edge_id)
+poll_trigger_and_run(flat)
 ```
-
-**Invariant:** wall/virtual time tracks **frame count**, so a 20 kHz sensor with `K=10` fires ~2 kHz chunk triggers but still represents 20k frames/s of product data. Threads never publish into a sibling edge’s pins.
-
-### Same compute model (all branch nodes)
-
-Every geometry/motion transformer is **frame-oriented**:
-
-```text
-in:  FloatBuffer   // 24*K
-out: FloatBuffer   // 24*K  (or features of length K / K*F)
-
-compute(slice):
-  assert in.size() % 24 == 0
-  K = in.size() / 24
-  // optional: parallel over channels and/or over frames via Slice
-  for f in 0 .. K-1:
-    process frame_view(in, f) → frame_view(out, f)   // same body for K=1
-```
-
-| Rule | Detail |
-|------|--------|
-| **No mode flag** | Do not `if (chunk) … else …`; `K=1` is just a short batch |
-| **Per-frame purity** | Calibrate, denoise, frame stats, profile, rules apply **identically** to each frame in the batch |
-| **State across emits** | EMA / trend / coalesce carry state across **frames**, whether those frames arrived as many `K=1` emits or fewer `K>1` emits |
-| **Parallelism** | `OnCollection`: grain over `K*24` channels flattened, or outer loop frames + inner 24; both are valid as long as results match serial |
-| **Coalesce** | Accumulates **frame count** (or mm), not emit count. A single `K=20` emit can complete `W_A=20` in one tick |
-| **Latch** | Updates from the **last** frame in the batch (or exposes full-batch features); timestamp = last frame time unless noted |
-| **Active / ready** | Chunk-wide: one ready pulse per emit when applicable; sub-frame dechunk only if a sink truly needs sample-rate streaming |
-
-### Sample path vs chunk path (logically identical)
-
-```text
-SAMPLE MODE (K=1)                     CHUNK MODE (K=W)
-emit → [frame] → cal → filter → …     emit → [frame×W] → cal → filter → …
-                 └─ coalesce(W) ─┐                      └─ coalesce may
-                    needs W emits│                         complete immediately
-```
-
-With the same nodes and wiring, switching `emit_frames` on the edge only changes **batching and trigger rate**, not graph topology or math.
-
-### Relation to existing engine nodes
-
-| Existing | Role relative to this design |
-|----------|------------------------------|
-| `FixedChunkCoalescer` | Scalar→buffer prototype; demo needs **frame** coalescer (`24×f32` units, count `W` frames) |
-| `BufferToStream` | Optional **dechunk** when a consumer must see one frame (or one channel sample) per sub-tick |
-| `ScaleFilter` / `OnCollection` | Pattern for channel-parallel ops on a flat `FloatBuffer`; extend to multi-frame buffers with `size % 24 == 0` |
-
-Prefer **keeping multi-frame buffers intact** through calibrate → filter → stats when `K>1` (one dirty cone pass processes the whole DMA block). Use dechunk only at edges that are inherently sample-stream (e.g. some logger/HMI paths).
-
-### Demo must prove (format dualism)
-
-| Property | Expectation |
-|----------|-------------|
-| Bit-identical features | Same ring replay → same latch/rule bits for `K=1` vs `K=W` (within float assoc. tolerance if parallel) |
-| Coalesce completeness | `W` frames complete a window whether delivered as `W` emits or one emit of `K=W` |
-| Time base | Stale / sustain / Hz metrics use **frame time**, not emit count |
-| Mixed branches | e.g. `edge_thick` chunked `K=10`, `edge_dist`/`edge_enc` sample `K=1` — fusion still LKG + freshness; still no shared input hub |
 
 ---
 
@@ -268,397 +206,342 @@ Prefer **keeping multi-frame buffers intact** through calibrate → filter → s
 Scheduling multiplexes **wakeups** only. Each wakeup names **one edge root**; data stays on that root’s branch until fusion.
 
 ```text
-[Thread thick]  arm edge_thick pins (24*K_A)  → push("edge_thick")
-[Thread dist]   arm edge_dist  pins (24*K_B)  → push("edge_dist")
-[Thread enc]    arm edge_enc   pins (24*K_C)  → push("edge_enc")
-[Thread plc]    push("edge_timer_plc")     // optional separate root
-[Thread scada]  push("edge_timer_scada")   // optional separate root
-
-[Session main loop]
-  id = triggers().wait_pop()
-  mark_dirty_reachable(flat, id)   // cone from THAT edge (and downstream joins if reachable)
-  tick(flat)                       // branch processes K frames for this emit
+arm edge_thick chunk  → push("edge_thick") → poll_trigger_and_run
+arm edge_dist  chunk  → push("edge_dist")  → poll_trigger_and_run
+arm edge_enc   raw    → push("edge_enc")   → poll_trigger_and_run
 ```
 
-| Seed id | What should run |
-|---------|-----------------|
-| `edge_thick` | Edge thick + branch A (+ fusion/outputs **if** wired downstream of latch A and marked reachable) |
-| `edge_dist` | Edge dist + branch B (+ …) |
-| `edge_enc` | Edge enc + branch C (+ …) |
-| `edge_timer_plc` | Timer edge + PLC poll path / fusion refresh without new geometry |
+| Seed id | Runs |
+|---------|------|
+| `edge_thick` | thick edge + branch A (+ fusion/PLC if reachable) |
+| `edge_dist` | dist edge + branch B (+ …) |
+| `edge_enc` | enc edge + branch C (+ …) |
 
 **Not** one `push("sensors")` that dirties all branches.
 
-Default demo matrix (tunable):
+**Demo matrix (shipped)**
 
-| Edge node | Frame rate | `emit_frames` K | Trigger rate |
-|-----------|------------|-----------------|--------------|
-| `edge_thick` | 20 kHz | 1 **and** 10 (two runs or param) | 20 kHz / 2 kHz |
-| `edge_dist` | 7 kHz | 1 | 7 kHz |
-| `edge_enc` | 2 kHz | 1 | 2 kHz |
+| Edge | Frame rate | K | Notes |
+|------|------------|---|--------|
+| thick | 20 kHz | 1 | spike plant |
+| dist | 7 kHz | 1 | dent plant |
+| enc | 2 kHz | 1 | stop gap + stale-C test |
 
-**Properties the demo should prove**
+**Properties proven**
 
-| Property | Expectation |
-|----------|-------------|
-| Multi-root | Flat graph has separate producer roots; no common sensor parent node |
-| Branch isolation | Tick seeded at `edge_thick` does not require B/C frames; branch B work is not a prerequisite for A |
-| Interleaving | Queue order = arrival order (FIFO) across edge ids |
-| No barrier | Branch A never blocks waiting for branch B |
-| Overrun | If thick outruns consumer, queue depth grows (measure HWM; optional drop policy later) |
-| Stale fusion | Stop enc updates → fail-safe deassert `go` after `stale_C` |
-| Independent coalesce | A windows complete on A **frames**; B on B **frames** |
-| Format dualism | §4b bit-identical / coalesce / time-base checks |
+| Property | Status |
+|----------|--------|
+| Multi-root | edges have no inbound wires |
+| Validate + converters | I16→F32 and raw→pose accepted |
+| Branch isolation / interleaved virtual time | event queue by next deadline |
+| Spike / route fault | thick mean OOB → cmp fail → route.b |
+| Dent | latch_b.dent |
+| Go true while healthy | fusion thick_ok ∧ dist_ok ∧ line_running ∧ fresh |
+| Go false on stop | line_running false |
+| Go false on stale C | t_now − t_c > stale_c |
 
-**Engine note:** today’s dirty cone marks the full reachable downstream set from the seed. If latches wire into fusion, a thick edge tick may also re-run fusion with **LKG** B/C — that is correct **late join** behavior, not an input choke point. Finer prune is optional later. One chunk emit = one edge seed; that branch processes `K` frames inside the tick (plus optional intra-node parallel).
+**Engine note:** dirty cone marks full reachable set from the seed. A thick tick may re-run fusion with **LKG** B/C — correct late join, not an input choke point.
 
 ---
 
-## 6. Branch layout (edge → own branch → late join)
+## 6. Branch layout (typed, implemented)
 
 ```text
-  edge_thick (input edge) ──► BRANCH A: cal → denoise → stats → window → rules → Latch_A ─┐
-  edge_dist  (input edge) ──► BRANCH B: cal → denoise → profile → defect → Latch_B ───────┼─► FUSION
-  edge_enc   (input edge) ──► BRANCH C: decode → speed/acc → phase → gates → Latch_C ─────┘     │
-                                                                                              ▼
-                                                                                   OUTPUT EDGES
-                                                                              PLC · MES · SCADA · …
+  edge_thick ──[conv]──► cal → ema → stats → cmp_lo/hi → and → route/latch_ok/latch_fault ─┐
+  edge_dist  ──[conv]──► cal → dent_rules → latch_b ───────────────────────────────────────┼─► fusion → plc
+  edge_enc   ──[conv]──► motion_pose → latch_c ────────────────────────────────────────────┘
 ```
 
 - **Horizontal:** each sensor path is self-contained from edge through latch.
-- **Vertical join:** only at fusion (and multi-input output edges), never at a shared source hub.
-- **Output edges** are separate consumer sinks on the far side (symmetric idea: many exits, many entrances).
+- **Vertical join:** only at `LqFusionSimple`.
+- **Decision vs routing:** compare/and decide; `RouteFeatures` only steers `FrameFeaturesF32` to a/b.
 
 ---
 
-## 7. Full logical graph
+## 7. Full logical graph (typed demo)
 
 ```mermaid
 flowchart TB
-  subgraph HARNESS["Harness threads — one clock per edge, not a data hub"]
-    HA["thread_thick → arm pins + push edge_thick"]
-    HB["thread_dist → arm pins + push edge_dist"]
-    HC["thread_enc → arm pins + push edge_enc"]
-    HP["thread_plc → push edge_timer_plc"]
-    HS["thread_scada → push edge_timer_scada"]
+  subgraph HARNESS["Virtual-time harness — not a data hub"]
+    HA["pull thick I16 + push edge_thick"]
+    HB["pull dist I16 + push edge_dist"]
+    HC["pull enc raw + push edge_enc"]
   end
 
   subgraph ENGINE["Session Engine — wakeup mux only"]
-    TQ["TriggerQueue FIFO<br/>edge ids only"]
-    SCH["mark_dirty_reachable(seed) → tick"]
+    TQ["TriggerQueue FIFO"]
+    SCH["poll_trigger_and_run"]
     TQ --> SCH
   end
 
   HA -.-> TQ
   HB -.-> TQ
   HC -.-> TQ
-  HP -.-> TQ
-  HS -.-> TQ
 
-  subgraph ROOTS["Authoring roots — independent input edges"]
-    ET["edge_thick<br/>Producer · 24×K_A out"]
-    ED["edge_dist<br/>Producer · 24×K_B out"]
-    EE["edge_enc<br/>Producer · 24×K_C out"]
-    EPLC["edge_timer_plc"]
-    ESCA["edge_timer_scada"]
+  subgraph ROOTS["Independent input edges"]
+    ET["edge_thick<br/>ChannelChunkI16"]
+    ED["edge_dist<br/>ChannelChunkI16"]
+    EE["edge_enc<br/>EncoderRawI16"]
   end
 
-  SCH -.->|seed edge_thick| ET
-  SCH -.->|seed edge_dist| ED
-  SCH -.->|seed edge_enc| EE
-  SCH -.->|seed timers| EPLC
-  SCH -.-> ESCA
+  SCH -.-> ET
+  SCH -.-> ED
+  SCH -.-> EE
 
-  subgraph BRANCH_A["Input branch A — only downstream of edge_thick"]
-    A1["ThickCalibrate"]
-    A2["ThickChannelFilter"]
-    A3["ThickFrameStats"]
-    A4["ThickROI"]
-    A5["CoalesceThick_W"]
-    A6["ThickTrend"]
-    A7["Rules A"]
-    A8["Latch_A"]
-    ET --> A1 --> A2 --> A3 --> A4 --> A8
-    A2 --> A5 --> A6 --> A7 --> A8
-    A3 --> A7
+  subgraph BRANCH_A["Branch A — thickness"]
+    A1["LqCalibrateF32"]
+    A2["LqEmaFilterF32"]
+    A3["LqStatsF32"]
+    A4["CompareScalar lo/hi"]
+    A5["AndBool"]
+    A6["RouteFeatures"]
+    A7["ThickPathLatch"]
+    A8["FaultFeatureLatch"]
+    ET -->|I16→F32 conv| A1 --> A2 --> A3
+    A3 -->|mean| A4 --> A5
+    A3 -->|features| A6
+    A5 --> A6
+    A5 --> A7
+    A6 -->|b| A8
   end
 
-  subgraph BRANCH_B["Input branch B — only downstream of edge_dist"]
-    B1["DistCalibrate"]
-    B2["DistChannelFilter"]
-    B3["ProfileShape"]
-    B4["CoalesceDist_U"]
-    B5["DefectBlob"]
-    B6["Rules B"]
-    B7["Latch_B"]
-    ED --> B1 --> B2 --> B3 --> B7
-    B3 --> B4 --> B5 --> B6 --> B7
-    B3 --> B6
+  subgraph BRANCH_B["Branch B — distance"]
+    B1["LqCalibrateF32"]
+    B2["LqDentRules"]
+    B3["DistPathLatch"]
+    ED -->|I16→F32 conv| B1 --> B2 --> B3
   end
 
-  subgraph BRANCH_C["Input branch C — only downstream of edge_enc"]
-    C1["EncDecode"]
-    C2["LineRunning / SpeedStable"]
-    C3["Latch_C"]
-    EE --> C1 --> C2 --> C3
+  subgraph BRANCH_C["Branch C — encoder"]
+    C1["LqEncMotionPose"]
+    C2["MotionPathLatch"]
+    EE -->|raw→pose conv| C1 --> C2
   end
 
-  subgraph FUSE["Late join — Fusion only here"]
-    F0["Freshness + LKG"]
-    F3["go · nogo_latch · grade · fault"]
-    F0 --> F3
+  subgraph FUSE["Late join"]
+    F["LqFusionSimple<br/>fresh + thick_ok + dist_ok + line_running"]
   end
 
-  A8 --> FUSE
-  B7 --> FUSE
-  C3 --> FUSE
-  EPLC --> FUSE
-
-  subgraph OUT["Output edges — many exits"]
-    PLC["edge_plc_gonogo"]
-    MES["edge_mes_event"]
-    SCA["edge_scada_trend"]
-    LOG["edge_logger_window"]
-    HMI["edge_hmi_flags"]
-  end
-
-  F3 --> PLC
-  F3 --> MES
-  F3 --> HMI
-  A8 --> SCA
-  B7 --> SCA
-  C3 --> SCA
-  ESCA --> SCA
-  A5 --> LOG
-  B4 --> LOG
-  A7 --> HMI
-  B6 --> HMI
-  C2 --> HMI
+  A7 --> F
+  B3 --> F
+  C2 --> F
+  F --> PLC["edge_plc EdgePlcGoNoGo"]
 ```
 
-**Read the diagram as:** three sensor cables into three edge nodes; three vertical branches; one fusion bar; many outbound apps. The trigger queue is drawn above the roots as a **scheduler**, not as a wire that carries `FloatBuffer`.
+Converters run on **edge copy** (not as graph nodes). Trigger queue carries edge **ids**, not payloads.
 
 ---
 
-## 8. Node responsibilities
+## 8. Node responsibilities (typed)
 
-**Shared contract for all branch transformers:** `in`/`out` geometry pins are `FloatBuffer` with `size % 24 == 0`, `K = size/24` frames per compute. Implementation is one loop (or parallel slices) over frames; **sample emit is `K=1`**, not a separate code path.
+Types and converters: `lq_types.hpp`. Force-link registrars: `src/register_builtin_nodes.cpp` (plus demo direct includes).
 
-### Input edges — one instance per source (graph roots)
+### Input edges
 
-| Node id (example) | Role |
-|-------------------|------|
-| `edge_thick` | Producer root for branch A; private thickness ring; `out` = `24×K_A` |
-| `edge_dist` | Producer root for branch B; private distance ring; `out` = `24×K_B` |
-| `edge_enc` | Producer root for branch C; private encoder ring; `out` = `24×K_C` |
-| `edge_timer_plc` / `edge_timer_scada` | Optional **additional** roots for poll cadences — not parents of sensor edges |
+| Node | Header | Role |
+|------|--------|------|
+| `ThickEdgeSourceI16` | `typed_edge_source.hpp` | Root A; `out` I16 chunk + `t_stamp` |
+| `DistEdgeSourceI16` | same | Root B |
+| `EncEdgeSourceRaw` | same | Root C; `out` raw encoder |
 
-| Concern | Rule |
-|---------|------|
-| Topology | **No** `edge_daq_all` / mux / bus node upstream of these three |
-| Wiring | Each `out` feeds only its branch until latch; cross-branch data only via fusion inputs |
-| Config | Per-instance `emit_frames`, frame `period`, jitter, ring |
-| Timing | Deadline += **K × period** on that edge’s thread only |
-| Trigger | `push` of **that** node’s stable id |
+No mux / `edge_daq_all`.
 
-### Branch A — thickness (downstream of `edge_thick` only)
+### Branch A — thickness
 
 | Node | Role |
 |------|------|
-| Calibrate | Per-channel affine → mm, **each** of K frames |
-| ChannelFilter | Parallel EMA/FIR across channels (and frames); state advances **per frame** |
-| FrameStats | mean, min, max, p2p **per frame** (length-K feature outs or packed) |
-| ROI | Optional edge mask / center band, per frame |
-| Coalesce W | Accumulate **W frames** (may complete inside one `K≥W` emit) |
-| Trend | slope, ripple energy on window |
-| Rules | in-spec band, uniformity, frame-to-frame spike (spike uses consecutive **frames**, including within a chunk) |
-| Latch_A | last features + rule bits + timestamp (last frame in batch) |
+| `LqCalibrateF32` | affine on F32 chunk (`scale`/`offset` literals) |
+| `LqEmaFilterF32` | per-channel EMA; demo `alpha=1` pass-through |
+| `LqStatsF32` | last-frame features + `mean:float` for compares |
+| `CompareScalar` ×2 | `value` wired; **`op` and `operand` separate pins** (GE/1.90, LE/2.10 literals) |
+| `AndBool` | thick band pass |
+| `RouteFeatures` | `sel` from and → data to `a` or fault `b` |
+| `ThickPathLatch` | LKG `t_stamp`, `ok`, `mean` |
+| `FaultFeatureLatch` | last routed fault features |
 
-### Branch B — distance / height (downstream of `edge_dist` only)
-
-| Node | Role |
-|------|------|
-| Calibrate / filter | Same frame-batch pattern as A at B’s rate / K |
-| ProfileShape | tilt, bow, residual vs plane, per frame |
-| Coalesce U | U **B-frames** |
-| DefectBlob | channels over threshold for M of U |
-| Rules | height band, dent, flatness |
-| Latch_B | latched features + bits + time |
-
-### Branch C — encoder / motion (downstream of `edge_enc` only)
+### Branch B — distance
 
 | Node | Role |
 |------|------|
-| Decode | pos, vel, acc, phase, valid from each frame in batch |
-| LineRunning | `vel > v_min` (last or any-frame policy — lock: **last** frame) |
-| SpeedStable | `std(vel window) < thr` over frame window |
-| Latch_C | motion gates + **mm cursor** (last pos) for distance-based sustain |
+| `LqCalibrateF32` | I16→F32 then affine |
+| `LqDentRules` | height band + dent thr on ch 10–12 |
+| `DistPathLatch` | `height_ok`, `dent`, `ok = height_ok ∧ ¬dent` |
 
-### Fusion — late join only (not an input hub)
+### Branch C — encoder
 
-First place geometry + motion **meet** in the graph. Uses **last-known-good (LKG)** latches, not zipped indices and not a shared sample clock:
+| Node | Role |
+|------|------|
+| `LqEncMotionPose` | `line_running = vel_x > v_min ∧ quality`; `pos_mm` |
+| `MotionPathLatch` | LKG motion gates + stamp |
+
+### Fusion — late join only
 
 ```text
-fresh_A = (t_now - t_A) <= stale_A    # e.g. 0.25–1 ms
-fresh_B = (t_now - t_B) <= stale_B    # e.g. 1–5 ms
-fresh_C = (t_now - t_C) <= stale_C    # e.g. 5–20 ms
+fresh_A = (t_now - t_a) <= stale_a   # demo 1 ms
+fresh_B = (t_now - t_b) <= stale_b   # demo 3 ms
+fresh_C = (t_now - t_c) <= stale_c   # demo 15 ms
+fresh_ok = fresh_A ∧ fresh_B ∧ fresh_C
 
-in_spec = ThickInSpec ∧ ThickUniform ∧ ¬ThickSpike
-        ∧ HeightInSpec ∧ Flatness ∧ ¬Dent
-
-line_ok = LineRunning ∧ SpeedStable ∧ fresh_C
-
-# fail-safe product release
-go = in_spec ∧ line_ok ∧ fresh_A ∧ fresh_B
-
-# scrap latch: product distance or wall time — not “K thickness frames”
-nogo_latch = integral_mm(¬in_spec ∧ line_ok) >= mm_thr
-          OR timer_ms(¬in_spec ∧ line_ok)    >= ms_thr
-
-grade      = soft score from margins to limits
-fault_code = priority(spike > dent > thick > flat > height > motion)
+go = thick_ok ∧ dist_ok ∧ line_running ∧ fresh_ok
+if !go: nogo_latch = true   # simple sticky in LqFusionSimple
 ```
 
-**Rationale:** momentary noise ≠ scrap; sustained out-of-family **while the line is running** → reject/alarm. Sustain in **mm or ms** so slow branch B does not redefine scrap when branch A is fast. Fusion is a **consumer of latches**, never a parent of the input edges.
+`LqFusionSimple` consumes latch outs + `t_now` literal; never parents the edges. Richer scrap sustain (mm/ms), grade, fault priority remain design follow-ups.
 
 ### Alignment strategies
 
-| Strategy | Use | MVP? |
-|----------|-----|------|
-| LKG (last known good) | Default fusion inputs | **Yes** |
-| Stale timeout | Safety / PLC go | **Yes** |
-| Encoder mm binning | Defect “at position” | **Yes** (sustain) |
-| Phase hold/match | Periodic tooling | Optional later |
-| Explicit resample node | Fixed-rate SCADA | Optional (timer samples latches) |
+| Strategy | Demo | Notes |
+|----------|------|-------|
+| LKG (last known good) | **Yes** | Path latches hold last features/gates |
+| Stale timeout | **Yes** | `stale_a/b/c` literals on `LqFusionSimple` |
+| Encoder mm binning / sustain | Follow-up | Design for scrap distance; not in `LqFusionSimple` |
+| Phase hold/match | Later | Periodic tooling |
+| Explicit resample / SCADA timer | Later | Timer roots sample latches |
 
 ---
 
-## 9. Output edges (fake external apps)
+## 9. Output edges
 
-| Edge node id | Cadence | Payload idea | Stand-in for |
-|--------------|---------|--------------|--------------|
-| `edge_plc_gonogo` | Fusion update and/or `edge_timer_plc` | `go`, `nogo_latched`, heartbeat | Discrete I/O / OPC coil |
-| `edge_mes_event` | On latch / rising fault | `{t, fault_code, grade, phase, mm}` | MQTT/Kafka event API |
-| `edge_scada_trend` | `edge_timer_scada` | mean thickness, bow, speed | Historian / dashboard |
-| `edge_logger_window` | Coalesce `ready` on branch A/B | last A/B windows | QA dump |
-| `edge_hmi_flags` | On rule/latch update | bitfield of rule outs | Operator panel |
+### Shipped
 
-Output edges are **sinks** on separate exit paths (many exits), symmetric to many input roots. v1 sinks **count emits**, checksum payloads, and record timestamps. No real network.
+| Node | Header role | Behavior |
+|------|-------------|----------|
+| `EdgePlcGoNoGo` (`edge_plc`) | Fake PLC sink | Inputs `go`, `nogo_latch`; counts emits; demo reads last values |
+
+Primary exit path: `fusion → edge_plc`. No sockets.
+
+### Design-only (not in typed demo graph)
+
+| Edge id (future) | Cadence idea | Stand-in for |
+|------------------|--------------|--------------|
+| `edge_mes_event` | Rising fault / latch | MES event bus |
+| `edge_scada_trend` | Timer root ~100 Hz | Historian / dashboard |
+| `edge_logger_window` | Coalesce `ready` | QA dump |
+| `edge_hmi_flags` | Rule/latch update | Operator panel |
+
+Many exits remain the target shape; v1 proves one PLC sink after late fusion.
 
 ---
 
 ## 10. Coalesce and physical windows
 
-- **Frame windows** are per-branch (`W` on A, `U` on B, `V` on C), measured in **frames**, independent of that edge’s `K`.
-- A coalescer must accept a partial batch: e.g. need 7 more frames, incoming `K=10` → emit window now, keep 3 pending (same as receiving ten `K=1` ticks).
-- Windows that mean “same length of product” should ultimately key off **encoder Δmm**, not equal frame counts across branches.
-- Recommended demo defaults:
-  - `W_A = 20` (~1 ms @ 20 kHz) for snappy tests; optional stress `W_A = 200`.
-  - `U_B = 10` at ~5–10 kHz.
-  - Sustain: e.g. **5–20 mm** or **5–20 ms** out of family while `line_ok`.
-  - Dual-format check: run Phase A twice with `edge_thick` `K=1` and `K=10` (or `K=W_A`).
+**Active typed path:** no coalescer. Per-emit work is cal → filter/stats or dent/motion → latch (K=1 in demo).
 
-Heavy math lives on **coalesced paths** and **parallel channel filters**; per-emit path stays light (stats + spike + motion gates) whether the emit holds 1 or K frames. Shop practice: fast interlock + slower analytics; DMA chunks are an I/O shape, not a different algorithm.
+**Follow-up design** (legacy FloatBuffer LQM / future typed windows):
+
+- Frame windows `W`/`U` per branch, independent of emit `K`.
+- Coalescer accepts partial batches (`need 7`, `K=10` → emit now, keep 3).
+- Product-length windows should key **encoder Δmm**, not equal frame counts across A/B.
+- Suggested defaults if reintroduced: `W_A=20`, `U_B=10`; sustain 5–20 mm or ms while line running.
+
+DMA/chunk shape is I/O amortization, not a different algorithm from K=1.
 
 ---
 
-## 11. Suggested demo phases (when implemented)
+## 11. Demo phases
 
-### Phase A — correctness (multi-root + desync + dual format)
+### Shipped — virtual-time typed correctness
 
-1. Build authoring graph with **three input edge roots** and disjoint branches until fusion; prebuild **per-edge** rings.
-2. Start **three** producer threads (one per edge) at nominal **frame** rates + jitter + phase offsets; each arms only its edge pins and `push`es only its edge id.
-3. Plant: thickness spike, distance dent, encoder stop gap.
-4. Assert:
-   - compiled graph has **no** single upstream sensor mux / bus parent of A+B+C;
-   - spike/dent affect the right rule bits without requiring simultaneous A/B frames;
-   - encoder stop → `line_ok` false → `go` false (fail-safe);
-   - stale C after timeout → `go` false;
-   - `nogo_latch` / MES count matches sustained faults (mm or ms policy).
-5. **Format matrix:** repeat key asserts with `emit_frames` on `edge_thick` ∈ `{1, 10}` (and optionally `K = W_A`) — latch/rule/MES outcomes match; coalesce window boundaries align on frame index.
+Implemented in [`line_quality_monitor_demo.cpp`](../demos/line_quality_monitor_demo.cpp):
 
-### Phase B — throughput / capacity
+1. Author **three roots** + disjoint branches until `LqFusionSimple`; prebuild I16/raw rings.
+2. Single-threaded **virtual-time** event queue (~20 / 7 / 2 kHz); arm one edge + `push` that id + `poll_trigger_and_run`.
+3. Plants: thickness spike, distance dent, encoder stop gap, then freeze-C for stale.
+4. Asserts (all required for `demo ok`):
+   - multi-root (no inbound wires on edges);
+   - validate accepts I16→F32 and raw→pose converters;
+   - spike → `thick_and` fail → `route.b` / fault latch;
+   - dent on branch B;
+   - `go` true while healthy;
+   - `go` false on encoder stop;
+   - `go` false when `t_now − t_c > stale_c`.
 
-1. Free-run **per-edge** producers (or paced); measure:
-   - achieved **frame** Hz and **emit** Hz per edge + jitter;
-   - trigger queue high-water mark (chunking should lower emit rate / queue pressure for same frame Hz);
-   - fusion / PLC update latency (A frame timestamp → PLC observe);
-   - × realtime vs nominal A/B/C **frame** rates.
-2. Optional workers sweep on parallel filter nodes; compare `K=1` vs `K>1` CPU for same frame throughput.
+Observed summary line (Debug): `multi-root ok`, `emits_a≈2006`, `spike=1 dent=1 route_fault=1 go_true=1 go_false_stop=1 go_false_stale=1`, then `demo ok`.
 
-### Phase C — ablation (optional)
+### Follow-up — not required for current exit 0
 
-Leave `edge_dist` or `edge_enc` unwired (or stop that thread) to attribute CPU and show fusion fail-safe when a branch is absent/stale — still without introducing a hub node.
+| Phase | Scope |
+|-------|--------|
+| K-matrix | Repeat asserts with `K_thick ∈ {1,10}` (types already allow K>1) |
+| Async producers | One OS thread per edge + real jitter (vs virtual-time queue) |
+| Throughput | Frame/emit Hz, queue HWM, seed→PLC latency, ×realtime |
+| Ablation | Leave dist/enc silent; fusion fail-safe without a hub |
+| Rich fusion | mm/ms sustain scrap, grade, fault priority, MES/SCADA sinks |
+| Coalesce windows | FrameChunkCoalescer on typed chunks |
 
 ---
 
 ## 12. Metrics
 
+### Observed / asserted in demo
+
+| Metric | Role |
+|--------|------|
+| Multi-root + converter validate | Topology / type system |
+| `spike`, `route_fault`, `dent` | Branch isolation under desync |
+| `go_true` / `go_false_stop` / `go_false_stale` | Fail-safe fusion |
+| `emits_a` (and B/C activity) | Harness ran multi-rate scenario |
+
+### Follow-up metrics
+
 | Metric | Why |
 |--------|-----|
-| Frame Hz and emit Hz + jitter per **edge** | Multi-rate health; chunking splits the two |
-| Trigger queue depth HWM | Overrun under skew; expect lower HWM at higher K for same frame Hz |
-| µs seed→sink (per **edge id**) | Budgeting per emit (amortize over K frames when chunked) |
-| `go` under stop / stale / burst A | Safety semantics |
-| MES events vs planted sustained faults | Temporal logic |
-| Checksums on SCADA/logger payloads | Determinism under replay |
-| Feature parity `K=1` vs `K>1` | Same compute model proof |
+| Frame Hz / emit Hz + jitter per edge | Multi-rate health; K splits the two |
+| Trigger queue HWM | Overrun under skew |
+| µs seed→PLC per edge id | Budgeting |
+| Feature parity K=1 vs K>1 | Same compute model |
+| MES/SCADA checksums | Determinism under replay |
 
-**Realtime note:** full fusion + 3×24 FIR on every thickness **frame** is tight near 50 µs single-core; chunk emits amortize scheduling overhead across K frames. Heavy work still prefers coalesced windows and parallel channel ops.
+Realtime: full fusion every 50 µs A-frame is tight on one core if heavy filters are always-on; prefer light interlock path + optional coalesced analytics.
 
 ---
 
-## 13. Implementation defaults to lock before coding
+## 13. Implementation defaults (typed demo)
 
-| Knob | Proposed default |
-|------|------------------|
-| Graph roots | `edge_thick`, `edge_dist`, `edge_enc` (+ optional timer edges); **no** sensor mux root |
-| Frame rates A/B/C | 20 kHz / 7 kHz / 2 kHz |
-| `emit_frames` K per edge | **1 / 1 / 1** primary; **K_thick=10** second run for dual-format proof |
-| Frame packing | Contiguous frames, 24 ch each (`size % 24 == 0`) |
-| Jitter | ±10% of **frame** period (clamped); apply on that edge’s emit deadline after `K×period` |
-| `stale_A/B/C` | 1 ms / 3 ms / 15 ms (wall/virtual time, not emit counts) |
-| `W_A` / `U_B` | 20 / 10 **frames** |
-| Sustain | 10 mm **or** 10 ms (pick one primary; allow both) |
-| PLC | Fusion-driven **and** `edge_timer_plc` @ 1 kHz |
-| SCADA | `edge_timer_scada` @ 100 Hz |
-| Encoder packing | 24×f32 as in §4 |
-| First cut | Correctness Phase A incl. multi-root + K-matrix + light throughput summary |
-
----
-
-## 14. Mapping to current engine capabilities
-
-| Design need | Existing support |
-|-------------|------------------|
-| Session executor | `Engine` + shared `tf::Executor` |
-| Desynced wakeups | `TriggerQueue::push` / `wait_pop` / `poll_trigger_and_run` |
-| Dirty from **one edge root** | `mark_dirty_reachable(flat, edge_node_id)` |
-| Multi-root authoring | Multiple producers in one `Graph`; wires define separate branches |
-| Parallel per-channel / batch work | `ParallelMode::OnCollection` + subflow grain on flat `FloatBuffer` |
-| Scalar coalesce prototype | `FixedChunkCoalescer` (pattern only; not frame-aware) |
-| Dechunk / sub-ticks | `BufferToStream` + `run_pass` when a sink needs one unit per sub-tick |
-| Temporal arming | `ArmThenGo` / rising_edge helpers |
-| Fan-out to many sinks | Multiple wires from one output (validate allows) |
-| Nesting (optional macros) | `GraphNode` + flatten splice |
-| Buffer-backed producer pattern | `BufferSource`-style `set_data` + `out` buffer (extend per edge instance) |
-
-**Gaps / demo-local nodes likely needed**
-
-- **Per-source input edge** class (or three configured instances): private ring, `emit_frames`, `FloatBuffer` out; **not** a multi-sensor hub.
-- **Frame-aware** calibrate / filter / stats on each branch: one compute model, `K = size/24`.
-- **FrameChunkCoalescer**: accumulate W **frames** from variable-K inputs (generalize `FixedChunkCoalescer`).
-- Latch node (timestamp + last buffer/features) at end of each branch.
-- Freshness + fusion boolean logic node(s) as the **late join** only.
-- Fake **output** edge sinks with emit counters (and optional frame counters).
-- Harness: **one thread per input edge** (+ optional timer threads) — never one thread that writes all edge pins in lockstep unless testing lockstep rejection.
-- Optional `BufferToStream`-style **FrameUnbatch** only if a consumer must see `K=1` sub-ticks from a chunked wire.
+| Knob | Value |
+|------|--------|
+| Graph roots | `edge_thick`, `edge_dist`, `edge_enc` — **no** sensor mux |
+| Frame rates A/B/C | 20 kHz / 7 kHz / 2 kHz (virtual time) |
+| Emit K | **1 / 1 / 1** |
+| Geometry | 24 ch; I16 milli-units on wire; F32 mm after conv/cal |
+| Encoder | raw counts → pose mm via `/100` |
+| Compare band | GE 1.90 ∧ LE 2.10 on thickness mean (`op` ∥ `operand` pins) |
+| `stale_a/b/c` | 1 ms / 3 ms / 15 ms |
+| Fusion `go` | `thick_ok ∧ dist_ok ∧ line_running ∧ fresh_*` |
+| PLC | Fusion-driven `EdgePlcGoNoGo` only |
+| Harness | Virtual-time multi-root; not lockstep multi-arm |
+| Const params | Unwired literals |
 
 ---
 
-## 15. Short story (for README blurb)
+## 14. Mapping to engine capabilities
 
-Three **separate input edge nodes** (thickness, distance, encoder) each own a replay ring and head an **independent branch**—no shared DAQ choke point. Edges emit **sample or chunk** (`24×K`) under one frame-batch compute model down the branch. A session **trigger queue** only multiplexes wakeups by edge id; payloads meet first at **late fusion** (LKG, freshness, motion gates, sustain in time or mm). Output edges mimic PLC, MES, SCADA, and HMI at their own cadences—shop-floor shaped multi-root I/O without real devices.
+| Design need | Support used by typed LQM |
+|-------------|---------------------------|
+| Session executor | `Engine{4}` + compile once |
+| Desynced wakeups | `TriggerQueue` + `poll_trigger_and_run` |
+| Dirty from one edge | seed = `edge_thick` / `edge_dist` / `edge_enc` |
+| Multi-root authoring | three producers; no inbound edge wires |
+| Typed pins + convert | `TypeRegistry` direct pairs on edge copy |
+| Decision params | separate pins + literals (`CompareScalar`) |
+| Fan-out | stats → compares and route; latches → fusion |
+| Fake sink | `EdgePlcGoNoGo` emit counter |
+
+| Still available / unused by this demo | Notes |
+|--------------------------------------|--------|
+| `ParallelMode::OnCollection` | Optional on channel filters |
+| `FixedChunkCoalescer` | Scalar pattern; not frame-LQM path |
+| `BufferToStream` / unbatch | If a sink needs K=1 sub-ticks |
+| `GraphNode` nesting | Optional macros |
+| Async edge threads | Follow-up harness |
+
+Legacy FloatBuffer LQM nodes under `nodes/line_quality/` remain for reference; registrars for typed nodes are force-linked from `register_builtin_nodes.cpp`.
+
+---
+
+## 15. Short story
+
+Three independent typed input edges (thickness I16, distance I16, encoder raw) each head their own branch after a **direct** edge converter. Branch A decides a thickness band with **separate** compare pins, routes features, and latches OK/fault; B dents; C motion gates. A virtual-time harness pushes **one edge id at a time**. Features meet only at **`LqFusionSimple`** (LKG + freshness + line running) and exit through a fake **PLC** go/nogo sink—multi-root shop-floor shape without a DAQ hub or real devices.
 
 ---
 
@@ -666,8 +549,11 @@ Three **separate input edge nodes** (thickness, distance, encoder) each own a re
 
 | Item | Status |
 |------|--------|
-| Design (this doc) | **Done** |
-| Demo code | **Done** — [`demos/line_quality_monitor_demo.cpp`](../demos/line_quality_monitor_demo.cpp), nodes in [`nodes/line_quality/`](../nodes/line_quality/) |
-| Doc entry in [demo.md](demo.md) | **Done** — section 8 |
+| Design (this doc) | **Done** — typed multi-root |
+| Typed nodes + converters | **Done** — `nodes/line_quality/lq_*`, `lq_types.hpp` |
+| Demo binary | **Done** — [`demos/line_quality_monitor_demo.cpp`](../demos/line_quality_monitor_demo.cpp) |
+| Build / run | **Green** — exit `0`, `demo ok` |
+| [demo.md](demo.md) §8 | **Done** — short summary |
+| Follow-ups | K>1 matrix, async producers, coalesce/MES/SCADA, rich scrap sustain |
 
-Phase A (multi-root, K=1/K=10 dual format, spike/dent/stop/stale, coalescer) and light Phase B async producers exit `0` on Debug MSVC.
+**Shipped proof:** multi-root · direct converters · CompareScalar pin split · route fault · dent · go true · go false (stop + stale-C) · PLC sink.

@@ -2,8 +2,10 @@
 
 #include "node_engine/pin.hpp"
 #include "node_engine/ports.hpp"
+#include "node_engine/type_registry.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -79,19 +81,17 @@ class Node {
     if (!p) {
       throw std::runtime_error(std::string("missing input pin: ") + std::string(pin_id));
     }
-    Value v = read_pin_as(*p, type_id_for<T>());
-    if constexpr (std::is_same_v<T, float>) {
-      return static_cast<float>(std::get<double>(v));
-    } else if constexpr (std::is_same_v<T, double>) {
-      return std::get<double>(v);
-    } else if constexpr (std::is_same_v<T, bool>) {
-      return std::get<bool>(v);
-    } else if constexpr (std::is_same_v<T, std::string>) {
-      return std::get<std::string>(v);
-    } else if constexpr (std::is_same_v<T, std::vector<double>>) {
-      return std::get<std::vector<double>>(v);
+    std::string want_key;
+    if constexpr (is_builtin_pin_v<T>) {
+      want_key = builtin_type_key(type_id_for<T>());
     } else {
-      static_assert(sizeof(T) == 0, "unsupported get<> type");
+      want_key = type_key_for<T>();
+    }
+    Value v = read_pin_as(*p, type_id_for<T>(), want_key);
+    if constexpr (is_builtin_pin_v<T>) {
+      return std::get<T>(v);
+    } else {
+      return TypeRegistry::instance().cast<T>(std::get<ObjectValue>(v));
     }
   }
 
@@ -101,10 +101,13 @@ class Node {
     if (!p) {
       throw std::runtime_error(std::string("missing output pin: ") + std::string(pin_id));
     }
-    if constexpr (std::is_same_v<T, float>) {
-      p->buffer = Value{static_cast<double>(value)};
-    } else {
+    if constexpr (is_builtin_pin_v<T>) {
       p->buffer = Value{std::move(value)};
+    } else {
+      p->buffer = Value{TypeRegistry::instance().make_object_value(std::move(value))};
+      if (p->type_key.empty()) {
+        p->type_key = type_key_for<T>();
+      }
     }
     p->connected = true;
   }

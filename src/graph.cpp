@@ -1,5 +1,7 @@
 #include "node_engine/graph.hpp"
 
+#include "node_engine/converter_registry.hpp"
+
 #include <queue>
 #include <stdexcept>
 #include <unordered_map>
@@ -108,11 +110,14 @@ std::vector<ValidationError> validate_graph(Graph const& graph) {
           ValidationError{"missing input pin " + wire.to_node + "." + wire.to_pin});
       continue;
     }
-    if (!can_autoconvert(out_pin->type, in_pin->type) &&
-        !(out_pin->type == TypeId::Dynamic || in_pin->type == TypeId::Dynamic)) {
-      errors.push_back(ValidationError{"incompatible types on wire " + wire.from_node + "." +
-                                       wire.from_pin + " -> " + wire.to_node + "." +
-                                       wire.to_pin});
+    {
+      std::string from_key = pin_type_key(out_pin->type, out_pin->type_key);
+      std::string to_key = pin_type_key(in_pin->type, in_pin->type_key);
+      if (!types_compatible(from_key, to_key, out_pin->type, in_pin->type)) {
+        errors.push_back(ValidationError{
+            "incompatible types on wire " + wire.from_node + "." + wire.from_pin + " -> " +
+            wire.to_node + "." + wire.to_pin + " (" + from_key + " -> " + to_key + ")"});
+      }
     }
   }
 

@@ -33,7 +33,7 @@ Boundary pins               left)                Taskflow DAG
 4. **One `compute(Slice)`** — nodes stay thread-agnostic; the engine may split buffer work.
 5. **Dirty / emit control** — temporal gates and event logic are normal nodes + flags.
 
-Current code status: **core engine implemented** (value/pin/node/graph/factory, validate + flatten with `GraphNode` splice, transient Taskflow scheduler with `ParallelHint`, temporal nodes, trigger queue, pipeline demo + expanded smoke tests). Optional later items (JSON, SHM, WaitSequence sugar, Shared lifetime) remain deferred — see [docs/initial-specs.md](docs/initial-specs.md).
+Current code status: **core engine implemented** (value/pin/node/graph/factory, typed pins + Object structs + direct converter registry, validate + flatten with `GraphNode` splice, transient Taskflow scheduler with `ParallelHint`, temporal nodes, trigger queue, pipeline/typed demos + expanded smoke tests). Optional later items (JSON, SHM, WaitSequence sugar, Shared lifetime / Tier-1 immutable fan-out) remain deferred — see [docs/initial-specs.md](docs/initial-specs.md) and [todo.md](todo.md).
 
 ---
 
@@ -45,6 +45,8 @@ node-graph-engine/
   BUILD.md                  ← short build cheat-sheet
   docs/
     initial-specs.md        ← full architecture + roadmap
+    types.md                ← pin type overview
+    type-system-converters.md ← Object types + direct converters
   CMakeLists.txt
   CMakePresets.json
   cmake/Dependencies.cmake  ← FetchContent Taskflow
@@ -238,15 +240,13 @@ No separate package manager step is required after the compiler/SDK/CMake/Ninja 
 ---
 
 ## Development roadmap (high level)
-
-1. ~~Bootstrap repo (CMake, Taskflow, hello demo)~~ **done**
-2. Core types: value / pin / node / graph / factory / `REGISTER_NODE`
-3. Type check, propagate, autoconvert, pin literals
-4. Boundary + `GraphNode` + clone + splice flatten
-5. Full Taskflow dirty scheduling + `ParallelHint` slices
-6. Temporal gates (coalesce / de-coalesce) + sub-ticks
-7. Trigger queue + event-style node demos
-8. Optional sugar later (see specs)
+~~Core types: value / pin / node / graph / factory / `REGISTER_NODE`~~ **done**
+3. ~~Type check, pin literals, Object structs, direct converters~~ **done** (see [docs/type-system-converters.md](docs/type-system-converters.md))
+4. ~~Boundary + `GraphNode` + clone + splice flatten~~ **done**
+5. ~~Full Taskflow dirty scheduling + `ParallelHint` slices~~ **done**
+6. ~~Temporal gates (coalesce / de-coalesce) + sub-ticks~~ **done**
+7. ~~Trigger queue + event-style node demos~~ **done**
+8. Optional sugar / Tier-1 immutable fan-out later (see specs + [todo.md](todo.md))
 
 Track detail and acceptance criteria in [docs/initial-specs.md](docs/initial-specs.md).
 
@@ -257,6 +257,11 @@ Track detail and acceptance criteria in [docs/initial-specs.md](docs/initial-spe
 | Doc | Purpose |
 |---|---|
 | [README.md](README.md) | Onboarding, install, first build |
+| [BUILD.md](BUILD.md) | Short build commands |
+| [docs/initial-specs.md](docs/initial-specs.md) | Architecture, node author surface, roadmap, constraints |
+| [docs/types.md](docs/types.md) | Pin type overview |
+| [docs/type-system-converters.md](docs/type-system-converters.md) | Object registration + direct converter system |
+| [docs/demo.md](docs/demo.md) | Demo catalog and how to run
 | [BUILD.md](BUILD.md) | Short build commands |
 | [docs/initial-specs.md](docs/initial-specs.md) | Architecture, node author surface, roadmap, constraints |
 | [LICENSE](LICENSE) | MIT |

@@ -12,6 +12,9 @@ struct FlatEdge {
   std::string from_pin;
   std::string to_node;
   std::string to_pin;
+  // Empty = identity copy; else converter pair is looked up at edge copy time
+  // from pin type keys (bound at validate/compile). Reserved for explicit bind.
+  std::string converter_name;
 };
 
 struct FlatGraph {

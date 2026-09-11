@@ -16,9 +16,12 @@ From the repo root (Windows, after MSVC env via `scripts/dev_env.ps1` if needed)
 .\build\demos\trigger_latency_demo.exe
 .\build\demos\nested_depth_validate_demo.exe
 .\build\demos\line_quality_monitor_demo.exe
+.\build\demos\typed_pins_converter_demo.exe
 ```
 
 CMake registers targets in [`demos/CMakeLists.txt`](../demos/CMakeLists.txt) via `node_engine_demo(...)`.
+
+Typed pins / converters walkthrough: [`typed_pins_converter_demo.cpp`](../demos/typed_pins_converter_demo.cpp) (see also [type-system-converters.md](type-system-converters.md)).
 
 ### Result notes
 
@@ -727,111 +730,65 @@ nested_depth_validate_demo ok
 
 ---
 
-## 8. `line_quality_monitor_demo` (shop-floor multi-root)
+## 8. `line_quality_monitor_demo` (typed multi-root)
 
 | | |
 |---|---|
 | **Source** | [`demos/line_quality_monitor_demo.cpp`](../demos/line_quality_monitor_demo.cpp) |
-| **Nodes** | [`nodes/line_quality/`](../nodes/line_quality/) (header-only, `REGISTER_NODE`) |
+| **Nodes** | [`nodes/line_quality/`](../nodes/line_quality/) (`lq_*` typed headers) |
 | **Design** | [`docs/line-quality-monitor.md`](line-quality-monitor.md) |
-| **Kind** | Correctness (Phase A) + light async capacity (Phase B) |
-| **Session model** | `Engine{4}`; `compile` once; `TriggerQueue` + `poll_trigger_and_run` per edge emit |
+| **Kind** | Correctness / typed shop-floor walkthrough |
+| **Session model** | `Engine{4}`; `compile` once; per-edge `TriggerQueue` + `poll_trigger_and_run` |
 
 ### Purpose
 
-Prove a **multi-root, desynced** line-quality monitor with **no sensor mux choke point**:
+Multi-root line quality with **realistic typed payloads** and **no sensor mux**:
 
-1. Three input edges (`edge_thick`, `edge_dist`, `edge_enc`) are graph roots; each owns a private ring and branch.
-2. Dual input format: thickness emits `FloatBuffer` size `24*K` for **K=1** (sample) and **K=10** (chunk) under one compute model.
-3. Virtual-time event queue drives edges at different periods (~20 / 7 / 2 kHz frames).
-4. Late join only at **fusion** (LKG + freshness + motion gates + go/nogo).
-5. Planted spike, dent, encoder stop, and stale-C paths flip go correctly; coalescer counts **frames**, not emits.
-6. Phase B: three async producer threads + mutex-guarded arm/poll for **~5 s** (iteration default; raise to 60s when stable), with **1 Hz live metrics** (input emit/frame/MB/s, poll rate, coalescer, fusion state, PLC/HMI rates).
+- Roots: `edge_thick` / `edge_dist` / `edge_enc` (I16 geometry chunks + raw encoder).
+- Edge converters: `ChannelChunkI16→F32` (milli→mm), `EncoderRawI16→PoseF32` (counts/100→mm).
+- Branch A: cal → EMA → stats → **CompareScalar** (separate `op` / `operand` pins) → **AndBool** → **RouteFeatures** → latches.
+- Branch B/C: dent rules / motion pose → path latches.
+- Late join: `LqFusionSimple` (freshness + thick/dist/line) → PLC sink.
+- Virtual-time multi-rate harness; plants spike, dent, encoder stop, stale-C.
+
+Const params are **unwired pin literals** (`cmp_lo`/`cmp_hi` op+operand).
 
 ### Graph (authoring)
 
 ```mermaid
 flowchart LR
-  edge_thick --> cal_a --> filt_a --> stats_a --> coal_a
-  stats_a --> rules_a --> latch_a
-  edge_thick --> latch_a
-  edge_dist --> cal_b --> filt_b --> rules_b --> latch_b
-  edge_dist --> latch_b
-  edge_enc --> enc_m --> latch_c
-  edge_enc --> latch_c
-  latch_a --> fusion
+  edge_thick -->|I16→F32| cal_a --> ema_a --> stats_a
+  stats_a --> cmp_lo --> thick_and
+  stats_a --> cmp_hi --> thick_and
+  stats_a --> route
+  thick_and --> route
+  thick_and --> latch_ok
+  route --> latch_fault
+  edge_dist -->|I16→F32| cal_b --> dent_b --> latch_b
+  edge_enc -->|raw→pose| motion_c --> latch_c
+  latch_ok --> fusion
   latch_b --> fusion
   latch_c --> fusion
   fusion --> edge_plc
-  fusion --> edge_mes
-  fusion --> edge_hmi
 ```
 
-**Authoring wires (summary)**
-
-| Branch | Path |
-|--------|------|
-| A thickness | `edge_thick` → cal → EMA → stats → rules + coalescer; latch_a from rules + `t_stamp` |
-| B distance | `edge_dist` → cal → EMA → profile rules; latch_b |
-| C encoder | `edge_enc` → motion → latch_c (`line_ok`, pos/vel) |
-| Join | latches → `fusion` → PLC / MES / HMI sinks |
-
-No node fans into the three edges; no `sensor_mux` / `edge_daq_all`.
-
-### Expected behavior
+### Expected / observed
 
 | Check | Expectation |
 |-------|-------------|
-| Multi-root | Edges have no inbound wires |
-| Phase A K=1 | spike, dent, go true, go false on stop, go false on stale C, `coal_ready ≥ 1` |
-| Phase A K=10 | same correctness; **fewer** thick emits than K=1 for similar duration |
-| Coalesce K=W=20 | single emit → `ready=true`, window size `24*20` |
-| Phase B | each async edge produces >0 emits in ~5 s wall; live 1 Hz metric blocks printed |
-| Exit | `line_quality_monitor_demo ok`, exit `0` |
-
-### Observed results (sample, Debug, MSVC 19.44)
+| Multi-root + validate | no inbound to edges; I16→F32 and raw→pose converters accepted |
+| Scenario | spike or route_fault, dent, go true, go false on stop, go false on stale C |
+| Exit | `demo ok`, exit `0` |
 
 ```
-line_quality_monitor_demo
-session workers: 4
-topology: edge_thick|edge_dist|edge_enc -> branches -> fusion -> sinks
-no sensor mux; dual format K=1 and K=10 on edge_thick
-
-multi-root: edge_thick/dist/enc have no inbound wires ok
-
---- Phase A K_thick=1 ---
-frames_a=2006 emits_a=2006 coal_ready=100 spike=1 dent=1 go_true=1
-go_false_stop=1 go_false_stale=1 nogo=0 mes_events=0
-
---- Phase A K_thick=10 ---
-frames_a=2050 emits_a=205 coal_ready=100 spike=1 dent=1 go_true=1
-go_false_stop=1 go_false_stale=1 nogo=0 mes_events=0
-
---- coalesce K=W=20 single emit ---
-single-emit full window ok
-
---- Phase B light (async producers, ~5s wall) ---
-targets: thick … | dist … | enc …
-live metrics every 1s …
-[  1s]
-  INPUT inst  A … emit/s … frame/s … MB/s   B …   C …
-  INPUT avg   …
-  GRAPH       poll … Hz  coal_win …  in_payload … MB/s
-  KEY NODES   fusion go=… | thick mean=… | dist dent=… | enc line_ok=… pos_mm=…
-  SINKS       plc … Hz  hmi … Hz  go_true …%
-…
-=== Phase B summary (60.0s wall) ===
-INPUT rates / PAYLOAD / GRAPH / SINKS totals
-
-line_quality_monitor_demo ok
+line_quality_monitor_demo (typed)
+multi-root ok; validate ok (I16->F32 and raw->pose converters on wires)
+--- virtual-time scenario ---
+emits_a=2006 spike=1 dent=1 route_fault=1 go_true=1 go_false_stop=1 go_false_stale=1
+demo ok
 ```
 
-**Readout**
-
-- Dual format is frame-count based: K=10 used ~10× fewer thick emits for similar frame count.
-- Coalescer completed full windows on both paths and on a single K=W emit.
-- Stale-C and encoder-stop both forced go false; healthy motion allowed go true.
-- Phase B currently runs ~**5 s** (iteration) with a live dashboard: per-edge input rate & payload MB/s, graph poll/coalesce bandwidth, fusion/key-node state, sink update rates. Targets are a ~**10× plant stress** (A 200 kHz / B 70 kHz / C 20 kHz) with large batched K so emit cadence stays ~1 kHz under Windows sleep granularity; achieved rates will lag on Debug when the poll path saturates.
+Details: [line-quality-monitor.md](line-quality-monitor.md). Related: [`typed_pins_converter_demo.cpp`](../demos/typed_pins_converter_demo.cpp), [type-system-converters.md](type-system-converters.md).
 
 ---
 
@@ -839,7 +796,7 @@ line_quality_monitor_demo ok
 
 Optional later engine work (not part of the six-demo set): descendant-only sub-ticks, fewer edge copies, Release perf baselines, WaitSequence/Select, JSON, SHM.
 
-Shop-floor follow-ups for line quality (optional): nogo sustain assert, MES event asserts, Release rate targets, real edge I/O adapters.
+Shop-floor follow-ups for line quality (optional): dual-format K>1 stress, async Phase B metrics, nogo sustain/MES sinks, Release rate targets, real edge I/O adapters.
 
 ---
 

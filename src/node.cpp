@@ -48,6 +48,7 @@ void Node::apply_ports(Ports const& ports) {
     Pin pin;
     pin.id = decl.id;
     pin.type = decl.type;
+    pin.type_key = decl.type_key;
     if (decl.has_literal) {
       pin.literal = decl.literal;
     }

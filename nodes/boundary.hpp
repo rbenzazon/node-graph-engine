@@ -65,8 +65,10 @@ class BoundaryOutString : public NodeBase<BoundaryOutString> {
 };
 
 inline std::unique_ptr<Node> make_boundary_in(TypeId t = TypeId::Float) {
+  // Note: Float aliases Float64; FloatBuffer aliases Float64Buffer — one case each.
   switch (t) {
     case TypeId::FloatBuffer:
+    case TypeId::Float32Buffer:
       return std::make_unique<BoundaryInBuffer>();
     case TypeId::Bool:
       return std::make_unique<BoundaryInBool>();
@@ -80,6 +82,7 @@ inline std::unique_ptr<Node> make_boundary_in(TypeId t = TypeId::Float) {
 inline std::unique_ptr<Node> make_boundary_out(TypeId t = TypeId::Float) {
   switch (t) {
     case TypeId::FloatBuffer:
+    case TypeId::Float32Buffer:
       return std::make_unique<BoundaryOutBuffer>();
     case TypeId::Bool:
       return std::make_unique<BoundaryOutBool>();
